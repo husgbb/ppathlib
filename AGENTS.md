@@ -19,6 +19,7 @@
 - Start from the smallest change that can be verified.
 - Use `uv` for virtual environment and dependency management during development.
 - Keep development dependencies in `pyproject.toml` under `[dependency-groups].dev`.
+- Write repository files in English, including documentation, code, comments, and test fixtures.
 - When changing path resolution or client construction logic, add or update tests first when practical.
 - Keep comments in code in English.
 - Keep user-facing documentation aligned with behavior changes in the same change set.
