@@ -10,6 +10,7 @@ from .gs.gsclient import GSClient
 from .gs.gspath import GSPath
 from .http.httpclient import HttpClient, HttpsClient
 from .http.httppath import HttpPath, HttpsPath
+from .ppath import clear_client_cache, get_client, PPath
 from .s3.s3client import S3Client
 from .s3.s3path import S3Path
 
@@ -38,6 +39,9 @@ __all__ = [
     "HttpsClient",
     "HttpPath",
     "HttpsPath",
+    "PPath",
+    "get_client",
+    "clear_client_cache",
     "patch_open",
     "patch_glob",
     "patch_os_functions",

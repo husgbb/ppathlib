@@ -17,6 +17,8 @@
 ## Development Workflow
 
 - Start from the smallest change that can be verified.
+- Use `uv` for virtual environment and dependency management during development.
+- Keep development dependencies in `pyproject.toml` under `[dependency-groups].dev`.
 - When changing path resolution or client construction logic, add or update tests first when practical.
 - Keep comments in code in English.
 - Keep user-facing documentation aligned with behavior changes in the same change set.
@@ -25,7 +27,8 @@
 ## Testing Expectations
 
 - Prefer targeted test runs while iterating.
-- Use `python3 -m pytest tests/<target> -n 0` for focused debugging.
+- Use `uv sync` to prepare the development environment when needed.
+- Use `uv run pytest tests/<target> -n 0` for focused debugging.
 - Run broader suites only after scoped changes are stable.
 - If optional cloud dependencies are missing, document what could not be executed.
 

@@ -2,7 +2,7 @@
 
 `ppathlib` is a path interface for local files and named remote storage.
 
-It behaves like `pathlib.Path` when no `profile` is provided, and it switches to remote mode when a `profile` is given. A profile maps to environment variables that define a backend such as S3, GCS, Azure Blob Storage, or SFTP, plus an optional default `ROOT`.
+It behaves like `pathlib.Path` when no `profile` is provided, and it switches to remote mode when a `profile` is given. A profile maps to environment variables that define a backend such as S3, GCS, or Azure Blob Storage, plus an optional default `ROOT`. SFTP and WebDAV support are planned `(구현 예정)`.
 
 The main examples in this README use S3 because that is the most familiar starting point for most users. The same model also works for other supported remotes.
 
