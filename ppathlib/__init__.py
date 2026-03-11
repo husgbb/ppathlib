@@ -24,7 +24,7 @@ else:
 try:
     __version__ = importlib_metadata.version(__name__.split(".", 1)[0])
 except importlib_metadata.PackageNotFoundError:
-    __version__ = "0.1.0a0"
+    __version__ = "0.1.0"
 
 
 __all__ = [
