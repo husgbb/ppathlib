@@ -37,8 +37,7 @@ dist: clean ## build source and wheel package
 	ls -l dist
 
 format:  ## run formatters
-	uv run black ppathlib ppath_tests
-	uv run ruff format ppathlib ppath_tests
+	uv run ruff format ppathlib tests
 
 help:
 	@python3 -c "$$PRINT_HELP_PYSCRIPT" < $(MAKEFILE_LIST)
@@ -46,10 +45,9 @@ help:
 install: clean ## install the package to the active Python's site-packages
 	uv sync
 
-lint: ## check style with black, ruff, and mypy
-	uv run black --check ppathlib ppath_tests
-	uv run ruff check ppathlib ppath_tests
-	uv run mypy ppathlib
+lint: ## check style with ruff and ty
+	uv run ruff check ppathlib tests
+	uv run ty check ppathlib tests
 
 reqs:  ## install development requirements
 	uv sync
