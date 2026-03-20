@@ -71,14 +71,20 @@ class _InMemoryRemoteStore:
 
     def delete(self, path: str | Sequence[str]) -> None:
         if isinstance(path, str):
-            self._objects.pop(path, None)
+            if path not in self._objects:
+                raise FileNotFoundError(path)
+            self._objects.pop(path)
             return
         if isinstance(path, (list, tuple)):
             for item in path:
-                self._objects.pop(item, None)
+                if item not in self._objects:
+                    raise FileNotFoundError(item)
+                self._objects.pop(item)
             return
         for item in path:
-            self._objects.pop(item, None)
+            if item not in self._objects:
+                raise FileNotFoundError(item)
+            self._objects.pop(item)
 
     def copy(self, from_: str, to: str, *, overwrite: bool = True) -> None:
         if from_ not in self._objects:
@@ -117,5 +123,5 @@ def install_in_memory_remote_store(monkeypatch) -> _InMemoryRemoteStore:
     from ppathlib.remote_path import RemoteProfileClient
 
     store = _InMemoryRemoteStore()
-    monkeypatch.setattr(RemoteProfileClient, "create_store", lambda self: store)
+    monkeypatch.setattr(RemoteProfileClient, "create_store", lambda self, *args, **kwargs: store)
     return store

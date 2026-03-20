@@ -1,3 +1,5 @@
+import pytest
+
 from ppathlib import PPath
 
 
@@ -44,3 +46,20 @@ def test_remote_lexical_transformations_do_not_require_backend_access():
         "archive/report.parquet"
     )
     assert path.is_relative_to(PPath("s3://public-bucket/daily")) is True
+
+
+def test_remote_bucket_root_parent_is_stable():
+    path = PPath("s3://public-bucket")
+
+    assert str(path.parent) == "s3://public-bucket"
+    assert path.parents == ()
+
+
+def test_remote_joinpath_rejects_absolute_segments_and_remote_uris():
+    path = PPath("s3://public-bucket/data")
+
+    with pytest.raises(ValueError, match="absolute"):
+        path.joinpath("/abs/file.txt")
+
+    with pytest.raises(ValueError, match="remote URIs"):
+        path.joinpath("s3://other-bucket/path.txt")

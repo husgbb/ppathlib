@@ -9,14 +9,17 @@ If code and tests disagree, this document is the reference for what success mean
 
 ## Scope
 
-The current contract defines three observable surfaces:
+The current contract defines four observable surfaces:
 
 1. `PPath` behavior in local mode
 2. `PPath` behavior in remote lexical mode
-3. TOML-based profile configuration behavior
+3. `PPath` behavior in remote runtime mode
+4. TOML-based profile configuration behavior
 
 For this document, `lexical` means path behavior that is derived only from the path string and profile metadata.
 Lexical behavior must not require backend network access, backend object metadata, or backend existence checks.
+
+For this document, `runtime` means backend-backed behavior that may perform I/O after lexical resolution is complete.
 
 ## Success Criteria
 
@@ -29,6 +32,11 @@ Lexical behavior must not require backend network access, backend object metadat
 - that object behaves like Python `pathlib` local path handling for local paths
 - it does not require remote configuration
 
+Local transfer helpers succeed when:
+
+- `copy()` and `move()` work on supported Python versions
+- local operations do not depend on stdlib methods that are unavailable in the supported version range
+
 ### 2. Remote Mode Entry
 
 `PPath(path, profile=...)` succeeds when:
@@ -37,10 +45,11 @@ Lexical behavior must not require backend network access, backend object metadat
 - that object uses remote mode internally
 - it accepts relative remote paths when the selected profile defines `root`
 - it accepts explicit remote URIs with a profile
-- it accepts explicit remote URIs without a profile when the URI is sufficient to identify a public remote resource
-- it does not require a profile for profile-less public remote access
+- it accepts explicit remote S3 URIs without a profile when the URI is sufficient to identify a public remote resource
+- it does not require a profile for profile-less public S3 access
 - it rejects relative remote paths when the selected profile does not define `root`
 - it rejects URI schemes that contradict the selected profile's `storage_type`
+- it rejects invalid profile roots early and explicitly
 
 ### 3. Lexical Remote Behavior
 
@@ -84,11 +93,11 @@ These operations fail this standard if they depend on:
 - backend object metadata
 - backend existence checks
 
-### 4. Placeholder Remote Behavior
+These operations also fail this standard if they silently cross bucket/container boundaries or generate invalid root URIs.
 
-Placeholder remote behavior succeeds when deferred runtime methods exist immediately and fail explicitly.
+### 4. Remote Runtime Behavior
 
-Required placeholder methods:
+Remote runtime behavior succeeds when these methods exist on remote paths and perform backend I/O:
 
 - `open`
 - `read_text`
@@ -108,9 +117,16 @@ Required placeholder methods:
 - `replace`
 - `unlink`
 
-Each placeholder succeeds when:
+Each runtime method succeeds when:
 
-- it raises `NotImplementedError`
+- it emits `ExperimentalRemoteRuntimeWarning`
+- it performs backend work only after remote lexical resolution is complete
+- it works with profiled remote paths
+- it keeps unsupported behavior explicit instead of silently pretending success
+
+Unsupported runtime slices succeed when:
+
+- they raise `NotImplementedError`
 - the message starts with:
   - `PPath.<method>() is not implemented for remote mode.`
 - the message includes:
@@ -118,6 +134,13 @@ Each placeholder succeeds when:
   - `Profile=<profile>`
   - `Storage type=<storage_type>`
   - `Required implementation: ...`
+
+Examples of unsupported runtime slices in the current contract:
+
+- `open()` append, exclusive-create, and read/write mixed modes
+- recursive remote directory transfer
+- profile-less public remote-to-local transfer
+- cross-scheme remote transfer
 
 ### 5. Configuration Discovery
 
@@ -142,6 +165,7 @@ Configuration succeeds when:
 - profile lookup is case-insensitive from the caller perspective
 - `storage_type` is required
 - `root` is optional but required for relative remote paths
+- `root`, when present, is an explicit remote URI whose scheme matches `storage_type`
 
 Supported storage types for this contract:
 
@@ -163,10 +187,11 @@ This contract succeeds when:
 
 This contract succeeds when:
 
-- backend runtime behavior is not yet required for lexical tests
-- backend construction remains abstract
-- documentation may state that the first runtime layer is expected to use `obstore`
+- lexical tests remain network-free
+- runtime tests may exercise real backend I/O when explicitly marked as live tests
+- documentation may state that the first runtime layer uses `obstore`
 - public runtime contracts do not depend on backend-specific type names
+- public S3 runtime access may use anonymous requests without requiring a profile
 
 ## Testing Guidance
 
@@ -174,11 +199,14 @@ Tests should be written to verify:
 
 1. exact mode selection
 2. exact lexical behavior
-3. exact configuration resolution rules
-4. exact placeholder failure messages
+3. exact runtime warning behavior
+4. exact configuration resolution rules
+5. exact unsupported-runtime failure messages
+6. live runtime behavior only in isolated prefixes or public lightweight objects
 
 Tests should not:
 
 - assume hidden fallback behavior
 - accept vague error text
-- depend on live backend connectivity when validating lexical behavior or placeholder contracts
+- treat shared live prefixes as deterministic
+- depend on live backend connectivity when validating lexical behavior

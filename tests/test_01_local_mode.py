@@ -72,3 +72,30 @@ def test_local_mode_does_not_require_configuration_files(project_dir):
     path = PPath("local/report.txt")
 
     assert str(path) == "local/report.txt"
+
+
+def test_local_mode_copy_and_move_work_on_supported_python_versions(tmp_path):
+    source = PPath(tmp_path / "source.txt")
+    copied = PPath(tmp_path / "copied.txt")
+    moved = PPath(tmp_path / "moved.txt")
+
+    source.write_text("hello", encoding="utf-8")
+
+    copied_result = source.copy(copied)
+    assert copied_result == copied
+    assert copied.read_text(encoding="utf-8") == "hello"
+
+    moved_result = copied.move(moved)
+
+    assert moved_result == moved
+    assert copied.exists() is False
+    assert moved.read_text(encoding="utf-8") == "hello"
+
+
+def test_local_mode_hash_matches_pathlib_for_equal_paths():
+    path = PPath("data/report.parquet")
+    reference = Path("data/report.parquet")
+
+    assert path == reference
+    assert hash(path) == hash(reference)
+    assert reference in {path}

@@ -1,5 +1,6 @@
 import sys
 
+from .exceptions import ExperimentalRemoteRuntimeWarning, InvalidConfigurationException
 from .remote_path import RemoteBindingRequest, RemotePath, RemoteProfileClient
 from .ppath import clear_client_cache, get_client, PPath
 
@@ -21,6 +22,8 @@ __all__ = [
     "RemotePath",
     "RemoteProfileClient",
     "PPath",
+    "ExperimentalRemoteRuntimeWarning",
+    "InvalidConfigurationException",
     "get_client",
     "clear_client_cache",
 ]

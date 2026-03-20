@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional, Union
 from urllib.parse import urlparse
 
-import tomli as tomllib
+import tomllib
 
 from .exceptions import InvalidConfigurationException
 from .remote_path import RemotePath, RemoteProfileClient
@@ -154,10 +155,28 @@ def _resolve_profile(profile: str) -> _ResolvedProfile:
         raise InvalidConfigurationException(
             f"Profile {display_name} must define a non-empty `storage_type`."
         )
+    storage_type = _canonical_storage_type(storage_type_value)
 
     root_value = raw_profile.get("root")
     if root_value is not None and not isinstance(root_value, str):
         raise InvalidConfigurationException(f"Profile {display_name} must define `root` as a string.")
+    root: Optional[str] = None
+    if root_value is not None:
+        root = root_value.strip()
+        if not root:
+            raise InvalidConfigurationException(
+                f"Profile {display_name} must define `root` as a non-empty remote URI."
+            )
+        if not _is_remote_uri(root):
+            raise InvalidConfigurationException(
+                f"Profile {display_name} must define `root` as an explicit remote URI."
+            )
+        expected_scheme = _scheme_for_storage_type(storage_type)
+        actual_scheme = urlparse(root).scheme.lower()
+        if actual_scheme != expected_scheme:
+            raise InvalidConfigurationException(
+                f"Profile {display_name} expects {expected_scheme}:// `root` URIs: {root}"
+            )
 
     client_kwargs = {
         key: value for key, value in raw_profile.items() if key not in {"storage_type", "root"}
@@ -165,19 +184,23 @@ def _resolve_profile(profile: str) -> _ResolvedProfile:
     return _ResolvedProfile(
         cache_name=display_name.casefold(),
         display_name=display_name,
-        storage_type=_canonical_storage_type(storage_type_value),
-        root=root_value,
+        storage_type=storage_type,
+        root=root,
         client_kwargs=client_kwargs,
     )
 
 
 def _public_profile_for_uri(uri: str) -> _ResolvedProfile:
+    storage_type = _storage_type_for_remote_uri(uri)
+    client_kwargs: dict[str, Any] = {}
+    if storage_type == "s3":
+        client_kwargs["skip_signature"] = True
     return _ResolvedProfile(
         cache_name="public",
         display_name="PUBLIC",
-        storage_type=_storage_type_for_remote_uri(uri),
+        storage_type=storage_type,
         root=None,
-        client_kwargs={},
+        client_kwargs=client_kwargs,
     )
 
 
@@ -297,7 +320,7 @@ class PPath(os.PathLike[str]):
         return self._impl == other
 
     def __hash__(self) -> int:
-        return hash((type(self), self._mode, self._impl))
+        return hash(self._impl)
 
     def __truediv__(self, other: PathLike) -> "PPath":
         return self._wrap_result(self._impl / _unwrap_value(other))
@@ -342,9 +365,29 @@ class PPath(os.PathLike[str]):
 
         if self._mode == "local" and target_is_remote:
             return self._copy_local_to_remote(unwrapped_target, method=method)
+        if self._mode == "local" and method in {"copy", "move"}:
+            return self._copy_or_move_local(unwrapped_target, method=method)
 
         attribute = getattr(self._impl, method)
         return attribute(unwrapped_target)
+
+    def _copy_or_move_local(self, target: Any, *, method: str) -> Path:
+        source = self._impl
+        if not isinstance(source, Path):
+            raise TypeError("Local copy/move operations require a local pathlib.Path source.")
+
+        target_path = Path(os.fspath(target))
+        if method == "copy":
+            if source.is_dir():
+                shutil.copytree(source, target_path, dirs_exist_ok=True)
+            else:
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target_path)
+            return target_path
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(os.fspath(source), os.fspath(target_path))
+        return target_path
 
     def _copy_local_to_remote(self, target: Any, *, method: str) -> RemotePath:
         source = self._impl

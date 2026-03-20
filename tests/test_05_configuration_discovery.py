@@ -133,3 +133,35 @@ def test_profile_lookup_is_case_insensitive(project_dir):
     upper = PPath("daily/report.parquet", profile="ANALYTICS")
 
     assert str(lower) == str(upper)
+
+
+def test_profile_root_must_be_an_explicit_remote_uri(project_dir):
+    write_project_config(
+        project_dir,
+        """
+        version = 1
+
+        [profiles.analytics]
+        storage_type = "s3"
+        root = "demo-bucket/warehouse"
+        """,
+    )
+
+    with pytest.raises(InvalidConfigurationException, match="explicit remote URI"):
+        PPath("daily/report.parquet", profile="analytics")
+
+
+def test_profile_root_scheme_must_match_storage_type(project_dir):
+    write_project_config(
+        project_dir,
+        """
+        version = 1
+
+        [profiles.analytics]
+        storage_type = "s3"
+        root = "gs://demo-bucket/warehouse"
+        """,
+    )
+
+    with pytest.raises(InvalidConfigurationException, match="expects s3:// `root` URIs"):
+        PPath("daily/report.parquet", profile="analytics")

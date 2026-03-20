@@ -1,7 +1,11 @@
 import pandas as pd
+import pytest
 
 from ppathlib import PPath
 from tests.support import install_in_memory_remote_store, write_project_config
+
+
+pytestmark = pytest.mark.filterwarnings("ignore::ppathlib.exceptions.ExperimentalRemoteRuntimeWarning")
 
 
 def test_remote_mode_supports_pathlib_style_file_round_trip(project_dir, monkeypatch):

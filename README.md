@@ -1,34 +1,27 @@
 # ppathlib
 
-`ppathlib` is currently in a remote-path prototype rewrite.
+`ppathlib` provides a `pathlib`-style public path object for local paths and named remote storage.
 
-The current prototype has two modes:
+The current library exposes one public path type:
 
-- `PPath(path)` returns `pathlib.Path`
-- `PPath(path, profile=...)` returns a `RemotePath` prototype object
+- `PPath(path)` uses local mode internally
+- `PPath(path, profile=...)` uses remote mode internally
+- `PPath("s3://...")` can also enter public remote mode without a profile for lightweight public S3 access
 
-## Prototype Status
+## Current Status
 
-The current remote-path implementation is not feature-complete.
+The library currently supports:
 
-Working now:
+- local mode with `pathlib`-style composition
+- remote lexical behavior such as `/`, `joinpath`, `name`, `stem`, `suffix`, `parent`, `parts`, `relative_to`, and `with_suffix`
+- backend-backed remote runtime operations such as `open`, `read_*`, `write_*`, `exists`, listing, globbing, copy, move, and unlink
+- project-scoped TOML configuration discovery
+- profile-less public S3 access for lightweight public objects
 
-- profile resolution
-- profile-bound binding request construction
-- local mode
-- remote lexical path behavior such as `/`, `joinpath`, `name`, `stem`, `suffix`, `parent`, `parts`, `relative_to`, `with_suffix`
-- explicit placeholder errors for deferred remote I/O
-- documentation governance through `docs/PHILOSOPHY.md`, `docs/STANDARD.md`, and `docs/DECISIONS.md`
+Remote runtime behavior is still experimental.
+Remote runtime methods emit `ExperimentalRemoteRuntimeWarning` so callers do not mistake the current behavior for a frozen contract.
 
-Deferred:
-
-- actual backend-backed remote reads and writes
-- remote listing and globbing
-- remote copy and move
-- bucket or container root listing
-- stdlib monkey-patch compatibility helpers
-
-The source of truth for the harness stage is the three-layer documentation set in `docs/`.
+The source of truth for project governance is the numbered documentation set in `docs/`.
 
 ## Installation
 
@@ -36,7 +29,7 @@ The source of truth for the harness stage is the three-layer documentation set i
 pip install ppathlib
 ```
 
-When remote behavior starts being implemented, the first backend runtime is expected to use `obstore` as an optional dependency.
+Minimum supported Python version: `3.11`.
 
 ## Quick Start
 
@@ -46,15 +39,16 @@ When remote behavior starts being implemented, the first backend runtime is expe
 from ppathlib import PPath
 
 path = PPath("data/local-report.parquet")
-assert path.read_text if hasattr(path, "read_text") else True
+print(path.mode)
+print(path.parent)
 ```
 
-### Remote Mode
+### Profiled Remote Mode
 
 ```toml
 version = 1
 
-[profiles.my_remote]
+[profiles.analytics]
 storage_type = "s3"
 endpoint_url = "https://storage.example.com"
 access_key_id = "xxx"
@@ -65,27 +59,30 @@ root = "s3://analytics-bucket"
 ```python
 from ppathlib import PPath
 
-path = PPath("daily/report.parquet", profile="MY_REMOTE")
+path = PPath("daily/report.parquet", profile="analytics")
 print(path)
 print(path.name)
 print(path.with_suffix(".csv"))
 ```
 
-At the current prototype stage, remote I/O methods such as `open()` are placeholders and will raise explicit implementation errors.
-The profile client can resolve remote scope and emit an abstract binding request, but it does not construct concrete runtime stores yet.
-URIs ending with `/`, such as `s3://bucket/a/`, are treated as directory-like prefixes by contract.
-Configuration is intended to come from `.ppathlib.toml` discovery in the project tree, with `~/.config/ppathlib/.ppathlib.toml` as the user-level fallback.
+### Public S3 Mode
+
+```python
+from ppathlib import PPath
+
+path = PPath("s3://wikisum/README.txt")
+print(path.read_text(encoding="utf-8")[:120])
+```
 
 ## Current API Surface
 
 ### `PPath(path, profile=None)`
 
-- if `profile` is omitted, returns `pathlib.Path`
-- if `profile` is provided, returns `RemotePath`
+Returns the public `PPath` object in either local or remote mode.
 
 ### `get_client(profile)`
 
-Returns the cached prototype profile client for a named remote.
+Returns the cached profile client for a named remote.
 
 ### `clear_client_cache()`
 
@@ -93,9 +90,10 @@ Clears the internal profile-client registry.
 
 ## Documentation
 
-- [Philosophy](docs/PHILOSOPHY.md)
-- [Standard](docs/STANDARD.md)
-- [Decisions](docs/DECISIONS.md)
+- [Philosophy](docs/0_PHILOSOPHY.md)
+- [Standard](docs/1_STANDARD.md)
+- [Decisions](docs/2_DECISIONS.md)
+- [Current Notes](docs/3_CURRENT.md)
 
 ## License
 

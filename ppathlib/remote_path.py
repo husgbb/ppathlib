@@ -8,10 +8,11 @@ import posixpath
 from pathlib import Path, PurePosixPath
 from typing import Any, NoReturn, Optional, Union
 from urllib.parse import urlparse
+import warnings
 
 from obstore.store import AzureStore, GCSStore, S3Store
 
-from .exceptions import InvalidConfigurationException
+from .exceptions import ExperimentalRemoteRuntimeWarning, InvalidConfigurationException
 
 
 PathLike = Union[str, os.PathLike[str]]
@@ -204,11 +205,23 @@ class RemotePath(os.PathLike[str]):
 
     @property
     def parent(self) -> "RemotePath":
+        if self._key.rstrip("/") == "":
+            return self
         return self._from_pure(self._pure.parent)
 
     @property
     def parents(self) -> tuple["RemotePath", ...]:
-        return tuple(self._from_pure(parent) for parent in self._pure.parents)
+        if self._key.rstrip("/") == "":
+            return ()
+
+        parents: list[RemotePath] = []
+        current = self.parent
+        while True:
+            parents.append(current)
+            if current._key.rstrip("/") == "":
+                break
+            current = current.parent
+        return tuple(parents)
 
     @property
     def parts(self) -> tuple[str, ...]:
@@ -232,7 +245,18 @@ class RemotePath(os.PathLike[str]):
     def joinpath(self, *pathsegments: PathLike) -> "RemotePath":
         pure = self._pure
         for segment in pathsegments:
-            pure = pure.joinpath(os.fspath(segment).replace("\\", "/"))
+            segment_text = os.fspath(segment).replace("\\", "/")
+            if not segment_text:
+                continue
+            if self._looks_like_remote_uri(segment_text):
+                raise ValueError(
+                    "Remote joinpath() does not accept explicit remote URIs as path segments."
+                )
+            if segment_text.startswith("/"):
+                raise ValueError(
+                    "Remote joinpath() does not accept absolute path segments."
+                )
+            pure = pure.joinpath(segment_text)
         return self._from_pure(pure)
 
     def with_name(self, name: str) -> "RemotePath":
@@ -274,6 +298,7 @@ class RemotePath(os.PathLike[str]):
         return PurePosixPath(candidate).match(pattern)
 
     def open(self, *args: Any, **kwargs: Any) -> Any:
+        self._warn_runtime_operation("open")
         mode = args[0] if args else kwargs.pop("mode", "r")
         if args:
             args = args[1:]
@@ -319,6 +344,7 @@ class RemotePath(os.PathLike[str]):
         raise NotImplementedError(f"PPath.open() does not support mode={mode!r} for remote paths yet.")
 
     def read_text(self, *args: Any, **kwargs: Any) -> str:
+        self._warn_runtime_operation("read_text")
         encoding = kwargs.pop("encoding", None) or "utf-8"
         errors = kwargs.pop("errors", None) or "strict"
         if args or kwargs:
@@ -326,9 +352,10 @@ class RemotePath(os.PathLike[str]):
                 "PPath.read_text() supports only the `encoding` and `errors` arguments "
                 "for remote mode in the current runtime slice."
             )
-        return self.read_bytes().decode(encoding, errors)
+        return self._read_bytes_impl().decode(encoding, errors)
 
     def write_text(self, *args: Any, **kwargs: Any) -> int:
+        self._warn_runtime_operation("write_text")
         if not args:
             raise TypeError("PPath.write_text() missing required argument: 'data'")
         data = args[0]
@@ -342,23 +369,30 @@ class RemotePath(os.PathLike[str]):
                 "remote mode in the current runtime slice."
             )
         payload = data.encode(encoding, errors)
-        self.write_bytes(payload)
+        self._write_bytes_impl(payload)
         return len(data)
 
     def read_bytes(self) -> bytes:
-        return bytes(self._store().get(self._store_key()).bytes())
+        self._warn_runtime_operation("read_bytes")
+        return self._read_bytes_impl()
 
     def write_bytes(self, data: bytes) -> int:
+        self._warn_runtime_operation("write_bytes")
         if not isinstance(data, (bytes, bytearray, memoryview)):
             raise TypeError("PPath.write_bytes() requires a bytes-like object.")
         payload = bytes(data)
-        self._store().put(self._store_key(), payload)
+        self._write_bytes_impl(payload)
         return len(payload)
 
     def exists(self, *, follow_symlinks: bool = True) -> bool:
-        return self.is_file() or self.is_dir()
+        self._warn_runtime_operation("exists")
+        return self._is_file_impl() or self._is_dir_impl()
 
     def is_file(self, *, follow_symlinks: bool = True) -> bool:
+        self._warn_runtime_operation("is_file")
+        return self._is_file_impl()
+
+    def _is_file_impl(self) -> bool:
         key = self._store_key()
         if key == "" or self._raw_uri.endswith("/"):
             return False
@@ -369,6 +403,10 @@ class RemotePath(os.PathLike[str]):
             return False
 
     def is_dir(self, *, follow_symlinks: bool = True) -> bool:
+        self._warn_runtime_operation("is_dir")
+        return self._is_dir_impl()
+
+    def _is_dir_impl(self) -> bool:
         key = self._store_key()
         if key == "":
             return True
@@ -376,7 +414,8 @@ class RemotePath(os.PathLike[str]):
         return bool(result["common_prefixes"] or result["objects"])
 
     def iterdir(self):
-        if not self.is_dir():
+        self._warn_runtime_operation("iterdir")
+        if not self._is_dir_impl():
             raise NotADirectoryError(str(self))
 
         result = self._list_result(self._directory_prefix())
@@ -393,7 +432,8 @@ class RemotePath(os.PathLike[str]):
         return iter(children)
 
     def glob(self, pattern: PathLike, *, case_sensitive: Optional[bool] = None, recurse_symlinks: bool = False):
-        if not self.is_dir():
+        self._warn_runtime_operation("glob")
+        if not self._is_dir_impl():
             raise NotADirectoryError(str(self))
         pattern_text = os.fspath(pattern).replace("\\", "/")
         if "/" not in pattern_text and "**" not in pattern_text:
@@ -413,7 +453,8 @@ class RemotePath(os.PathLike[str]):
         return iter(matches)
 
     def rglob(self, pattern: PathLike, *, case_sensitive: Optional[bool] = None, recurse_symlinks: bool = False):
-        if not self.is_dir():
+        self._warn_runtime_operation("rglob")
+        if not self._is_dir_impl():
             raise NotADirectoryError(str(self))
         pattern_text = os.fspath(pattern).replace("\\", "/")
         matches = []
@@ -429,7 +470,8 @@ class RemotePath(os.PathLike[str]):
         return iter(matches)
 
     def walk(self, top_down: bool = True, on_error: Any = None, follow_symlinks: bool = False):
-        if not self.is_dir():
+        self._warn_runtime_operation("walk")
+        if not self._is_dir_impl():
             raise NotADirectoryError(str(self))
 
         tree = self._walk_tree()
@@ -450,6 +492,7 @@ class RemotePath(os.PathLike[str]):
         return emit("")
 
     def copy(self, target: PathLike) -> Any:
+        self._warn_runtime_operation("copy")
         target_path = self._coerce_target_path(target, method="copy")
         if isinstance(target_path, Path):
             return self._copy_to_local_path(target_path, method="copy")
@@ -458,42 +501,71 @@ class RemotePath(os.PathLike[str]):
             self._store().copy(self._store_key(), target_path._store_key(), overwrite=True)
             return target_path
 
-        target_path.write_bytes(self.read_bytes())
+        target_path._write_bytes_impl(self._read_bytes_impl())
         return target_path
 
     def move(self, target: PathLike) -> Any:
-        target_path = self._coerce_target_path(target, method="move")
+        self._warn_runtime_operation("move")
+        return self._move_impl(target, method="move")
+
+    def rename(self, target: PathLike) -> Any:
+        self._warn_runtime_operation("rename")
+        return self._move_impl(target, method="rename")
+
+    def replace(self, target: PathLike) -> Any:
+        self._warn_runtime_operation("replace")
+        return self._move_impl(target, method="replace")
+
+    def unlink(self, missing_ok: bool = False) -> None:
+        self._warn_runtime_operation("unlink")
+        self._delete_impl(missing_ok=missing_ok)
+
+    def _from_pure(self, pure: PurePosixPath) -> "RemotePath":
+        lexical = pure.as_posix().lstrip("/")
+        uri = f"{self.anchor}{lexical}" if lexical else self._bucket_uri()
+        return type(self)(uri, client=self.client)
+
+    def _warn_runtime_operation(self, method: str) -> None:
+        warnings.warn(
+            (
+                f"PPath.{method}() for remote mode is experimental. "
+                "Its runtime behavior may change while the remote contract is stabilized."
+            ),
+            ExperimentalRemoteRuntimeWarning,
+            stacklevel=3,
+        )
+
+    def _read_bytes_impl(self) -> bytes:
+        return bytes(self._store().get(self._store_key()).bytes())
+
+    def _write_bytes_impl(self, payload: bytes) -> None:
+        self._store().put(self._store_key(), payload)
+
+    def _move_impl(self, target: PathLike, *, method: str) -> Any:
+        target_path = self._coerce_target_path(target, method=method)
         if isinstance(target_path, Path):
-            copied = self._copy_to_local_path(target_path, method="move")
-            self.unlink()
+            copied = self._copy_to_local_path(target_path, method=method)
+            self._delete_impl(missing_ok=False)
             return copied
 
         if self._can_use_native_remote_transfer(target_path):
             self._store().rename(self._store_key(), target_path._store_key(), overwrite=True)
             return target_path
 
-        target_path.write_bytes(self.read_bytes())
-        self.unlink()
+        target_path._write_bytes_impl(self._read_bytes_impl())
+        self._delete_impl(missing_ok=False)
         return target_path
 
-    def rename(self, target: PathLike) -> Any:
-        return self.move(target)
-
-    def replace(self, target: PathLike) -> Any:
-        return self.move(target)
-
-    def unlink(self, missing_ok: bool = False) -> None:
+    def _delete_impl(self, *, missing_ok: bool) -> None:
         key = self._store_key()
         if key == "":
             raise IsADirectoryError(f"Remote root prefixes cannot be unlinked: {self}")
-        if not missing_ok and not self.exists():
-            raise FileNotFoundError(str(self))
-        self._store().delete(key)
-
-    def _from_pure(self, pure: PurePosixPath) -> "RemotePath":
-        lexical = pure.as_posix().lstrip("/")
-        uri = f"{self.anchor}{lexical}" if lexical else self.anchor
-        return type(self)(uri, client=self.client)
+        try:
+            self._store().delete(key)
+        except FileNotFoundError as exc:
+            if missing_ok:
+                return
+            raise FileNotFoundError(str(self)) from exc
 
     def _bucket_uri(self) -> str:
         return f"{self.anchor}{self.drive}"
@@ -648,14 +720,14 @@ class RemotePath(os.PathLike[str]):
                 "support remote-to-local transfers for profileless public URIs explicitly "
                 "before accepting local targets",
             )
-        if self.is_dir():
+        if self._is_dir_impl():
             self._not_implemented(
                 method,
                 "support recursive remote directory transfers explicitly before accepting "
                 "directory-like prefixes as copy sources",
             )
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(self.read_bytes())
+        target.write_bytes(self._read_bytes_impl())
         return target
 
     def _can_use_native_remote_transfer(self, target: "RemotePath") -> bool:
@@ -683,3 +755,7 @@ class RemotePath(os.PathLike[str]):
             f"Profile={self.client.profile_name}. Storage type={self.client.storage_type}. "
             f"Required implementation: {required_implementation}."
         )
+
+    def _looks_like_remote_uri(self, value: str) -> bool:
+        parsed = urlparse(value)
+        return "://" in value and bool(parsed.scheme)
