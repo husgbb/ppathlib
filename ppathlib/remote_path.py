@@ -5,7 +5,7 @@ from fnmatch import fnmatch
 import io
 import os
 import posixpath
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, NoReturn, Optional, Union
 from urllib.parse import urlparse
 
@@ -450,22 +450,37 @@ class RemotePath(os.PathLike[str]):
         return emit("")
 
     def copy(self, target: PathLike) -> Any:
-        target_path, target_key = self._resolve_remote_target(target, method="copy")
-        self._store().copy(self._store_key(), target_key, overwrite=True)
+        target_path = self._coerce_target_path(target, method="copy")
+        if isinstance(target_path, Path):
+            return self._copy_to_local_path(target_path, method="copy")
+
+        if self._can_use_native_remote_transfer(target_path):
+            self._store().copy(self._store_key(), target_path._store_key(), overwrite=True)
+            return target_path
+
+        target_path.write_bytes(self.read_bytes())
         return target_path
 
     def move(self, target: PathLike) -> Any:
-        target_path, target_key = self._resolve_remote_target(target, method="move")
-        self._store().rename(self._store_key(), target_key, overwrite=True)
+        target_path = self._coerce_target_path(target, method="move")
+        if isinstance(target_path, Path):
+            copied = self._copy_to_local_path(target_path, method="move")
+            self.unlink()
+            return copied
+
+        if self._can_use_native_remote_transfer(target_path):
+            self._store().rename(self._store_key(), target_path._store_key(), overwrite=True)
+            return target_path
+
+        target_path.write_bytes(self.read_bytes())
+        self.unlink()
         return target_path
 
     def rename(self, target: PathLike) -> Any:
         return self.move(target)
 
     def replace(self, target: PathLike) -> Any:
-        target_path, target_key = self._resolve_remote_target(target, method="replace")
-        self._store().rename(self._store_key(), target_key, overwrite=True)
-        return target_path
+        return self.move(target)
 
     def unlink(self, missing_ok: bool = False) -> None:
         key = self._store_key()
@@ -598,35 +613,69 @@ class RemotePath(os.PathLike[str]):
 
         return tree
 
-    def _resolve_remote_target(self, target: PathLike, *, method: str) -> tuple["RemotePath", str]:
-        if not isinstance(target, RemotePath):
-            target_text = os.fspath(target)
-            if not self._is_remote_target_text(target_text):
-                self._not_implemented(
-                    method,
-                    "support remote-to-local and local-to-remote transfers explicitly before "
-                    "accepting non-remote targets",
-                )
-            target = type(self)(target_text, client=self.client)
+    def _coerce_target_path(self, target: PathLike, *, method: str) -> Path | "RemotePath":
+        if isinstance(target, RemotePath):
+            return target
 
-        if target.anchor != self.anchor:
+        target_text = os.fspath(target)
+        if not self._is_remote_target_text(target_text):
+            return Path(target_text)
+
+        target_storage_type = self._storage_type_for_scheme(urlparse(target_text).scheme.lower())
+        if target_storage_type != self.client.storage_type:
             self._not_implemented(
                 method,
                 "support cross-scheme remote transfers explicitly before accepting targets "
-                "outside the source scheme",
-            )
-        if target.drive != self.drive:
-            self._not_implemented(
-                method,
-                "support cross-bucket or cross-container remote transfers explicitly before "
-                "accepting targets outside the source store scope",
+                "outside the source storage type",
             )
 
-        return target, target._store_key()
+        target_client = RemoteProfileClient(
+            profile_name=self.client.profile_name,
+            storage_type=self.client.storage_type,
+            root=None,
+            client_kwargs=dict(self.client.client_kwargs),
+        )
+        return type(self)(target_text, client=target_client)
 
     def _is_remote_target_text(self, target: str) -> bool:
         parsed = urlparse(target)
         return bool(parsed.scheme and parsed.netloc)
+
+    def _copy_to_local_path(self, target: Path, *, method: str) -> Path:
+        if self.client.profile_name == "PUBLIC":
+            self._not_implemented(
+                method,
+                "support remote-to-local transfers for profileless public URIs explicitly "
+                "before accepting local targets",
+            )
+        if self.is_dir():
+            self._not_implemented(
+                method,
+                "support recursive remote directory transfers explicitly before accepting "
+                "directory-like prefixes as copy sources",
+            )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(self.read_bytes())
+        return target
+
+    def _can_use_native_remote_transfer(self, target: "RemotePath") -> bool:
+        return (
+            self.client.profile_name == target.client.profile_name
+            and self.client.storage_type == target.client.storage_type
+            and self.client.root == target.client.root
+            and self.client.client_kwargs == target.client.client_kwargs
+            and self.anchor == target.anchor
+            and self.drive == target.drive
+        )
+
+    def _storage_type_for_scheme(self, scheme: str) -> str:
+        if scheme == "s3":
+            return "s3"
+        if scheme == "gs":
+            return "gs"
+        if scheme == "az":
+            return "azure"
+        raise InvalidConfigurationException(f"Unsupported remote URI scheme for target: {scheme}://")
 
     def _not_implemented(self, method: str, required_implementation: str) -> NoReturn:
         raise NotImplementedError(

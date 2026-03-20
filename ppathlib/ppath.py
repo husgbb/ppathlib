@@ -302,6 +302,18 @@ class PPath(os.PathLike[str]):
     def __truediv__(self, other: PathLike) -> "PPath":
         return self._wrap_result(self._impl / _unwrap_value(other))
 
+    def copy(self, target: PathLike) -> Any:
+        return self._wrap_result(self._transfer_or_delegate("copy", target))
+
+    def move(self, target: PathLike) -> Any:
+        return self._wrap_result(self._transfer_or_delegate("move", target))
+
+    def rename(self, target: PathLike) -> Any:
+        return self._wrap_result(self._transfer_or_delegate("rename", target))
+
+    def replace(self, target: PathLike) -> Any:
+        return self._wrap_result(self._transfer_or_delegate("replace", target))
+
     def __getattr__(self, name: str) -> Any:
         attribute = getattr(self._impl, name)
         if callable(attribute):
@@ -323,6 +335,53 @@ class PPath(os.PathLike[str]):
         if isinstance(result, list):
             return [self._wrap_result(item) for item in result]
         return result
+
+    def _transfer_or_delegate(self, method: str, target: PathLike) -> Any:
+        unwrapped_target = _unwrap_value(target)
+        target_is_remote = self._is_remote_target(unwrapped_target)
+
+        if self._mode == "local" and target_is_remote:
+            return self._copy_local_to_remote(unwrapped_target, method=method)
+
+        attribute = getattr(self._impl, method)
+        return attribute(unwrapped_target)
+
+    def _copy_local_to_remote(self, target: Any, *, method: str) -> RemotePath:
+        source = self._impl
+        if not isinstance(source, Path):
+            raise TypeError("Local-to-remote transfers require a local pathlib.Path source.")
+        if source.is_dir():
+            raise NotImplementedError(
+                f"PPath.{method}() does not implement recursive local directory transfers "
+                "to remote targets yet."
+            )
+
+        remote_target = self._coerce_remote_target(target)
+        remote_target.write_bytes(source.read_bytes())
+        if method in {"move", "rename", "replace"}:
+            source.unlink()
+        return remote_target
+
+    def _coerce_remote_target(self, target: Any) -> RemotePath:
+        if isinstance(target, RemotePath):
+            return target
+
+        target_text = os.fspath(target)
+        if not _is_remote_uri(target_text):
+            raise TypeError(f"Expected a remote target URI or remote PPath, got: {target_text!r}")
+
+        resolved = _public_profile_for_uri(target_text)
+        client = _get_client_for_resolved_profile(resolved)
+        return RemotePath(target_text, client=client)
+
+    def _is_remote_target(self, target: Any) -> bool:
+        if isinstance(target, RemotePath):
+            return True
+        if isinstance(target, os.PathLike):
+            return _is_remote_uri(os.fspath(target))
+        if isinstance(target, str):
+            return _is_remote_uri(target)
+        return False
 
 
 def get_client(profile: str) -> RemoteProfileClient:
