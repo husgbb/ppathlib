@@ -43,3 +43,8 @@ If implementation needs a new architectural choice, that choice must be added he
 
 ### D-009: Directory-Like Prefix Semantics
 - Decision: `s3://bucket/a/` is treated as a directory-like prefix
+
+### D-010: Test Modification Approval
+- Decision: AI agents must not modify tests without explicit human approval
+- Consequence: implementation may change without prior approval when requested
+- Consequence: any test change requires explicit human approval before editing
