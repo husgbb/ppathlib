@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+import posixpath
 from pathlib import PurePosixPath
-from typing import Any, Optional, Union
+from typing import Any, NoReturn, Optional, Union
 from urllib.parse import urlparse
 
 from .exceptions import InvalidConfigurationException
@@ -212,7 +213,10 @@ class RemotePath(os.PathLike[str]):
             raise ValueError(f"{other!r} is not a RemotePath")
         if self.anchor != other.anchor:
             raise ValueError(f"{self} and {other} use different URI schemes")
-        return self._pure.relative_to(other._pure, walk_up=walk_up)
+        if not walk_up:
+            return self._pure.relative_to(other._pure)
+        relative = posixpath.relpath(self._pure.as_posix(), other._pure.as_posix())
+        return PurePosixPath(relative)
 
     def is_relative_to(self, other: "RemotePath") -> bool:
         try:
@@ -222,10 +226,16 @@ class RemotePath(os.PathLike[str]):
             return False
 
     def match(self, path_pattern: str, *, case_sensitive: Optional[bool] = None) -> bool:
-        return self._pure.match(path_pattern, case_sensitive=case_sensitive)
+        if case_sensitive is False:
+            return PurePosixPath(self._pure.as_posix().lower()).match(path_pattern.lower())
+        return self._pure.match(path_pattern)
 
     def full_match(self, pattern: str, *, case_sensitive: Optional[bool] = None) -> bool:
-        return self._pure.full_match(pattern, case_sensitive=case_sensitive)
+        candidate = self._pure.as_posix()
+        if case_sensitive is False:
+            candidate = candidate.lower()
+            pattern = pattern.lower()
+        return PurePosixPath(candidate).match(pattern)
 
     def open(self, *args: Any, **kwargs: Any) -> Any:
         self._not_implemented(
@@ -345,9 +355,9 @@ class RemotePath(os.PathLike[str]):
         uri = f"{self.anchor}{lexical}" if lexical else self.anchor
         return type(self)(uri, client=self.client)
 
-    def _not_implemented(self, method: str, required_implementation: str) -> None:
+    def _not_implemented(self, method: str, required_implementation: str) -> NoReturn:
         raise NotImplementedError(
-            f"RemotePath.{method}() is not implemented. Path={self}. "
+            f"PPath.{method}() is not implemented for remote mode. Path={self}. "
             f"Profile={self.client.profile_name}. Storage type={self.client.storage_type}. "
             f"Required implementation: {required_implementation}."
         )

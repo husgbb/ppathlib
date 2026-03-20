@@ -1,26 +1,37 @@
+from pathlib import Path
+
 import pandas as pd
+import pytest
 
 from ppathlib import PPath
-from tests.support import write_project_config
 
 
-def test_remote_mode_supports_pathlib_style_file_round_trip(project_dir):
-    write_project_config(
-        project_dir,
-        """
-        version = 1
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
 
-        [profiles.analytics]
-        storage_type = "s3"
-        root = "s3://demo-bucket/warehouse"
-        endpoint_url = "https://storage.example.com"
-        access_key_id = "access-key"
-        secret_access_key = "secret-key"
-        """,
+
+def _live_config_is_ready() -> bool:
+    config_path = _repo_root() / ".ppathlib.toml"
+    if not config_path.is_file():
+        return False
+    content = config_path.read_text(encoding="utf-8")
+    placeholders = (
+        "<your-r2-bucket>",
+        "<your-test-prefix>",
+        "<your-account-id>",
+        "<fill-me>",
     )
+    return not any(placeholder in content for placeholder in placeholders)
 
-    data_dir = PPath("datasets", profile="analytics")
 
+@pytest.mark.live_remote
+def test_live_r2_round_trip_uses_project_root_configuration(monkeypatch):
+    if not _live_config_is_ready():
+        pytest.skip("Fill the root .ppathlib.toml file with live R2 credentials to run this test.")
+
+    monkeypatch.chdir(_repo_root())
+
+    data_dir = PPath("live-tests", profile="r2_live")
     input_path = data_dir / "source/input.csv"
     output_path = data_dir / "output/pred.csv"
 
