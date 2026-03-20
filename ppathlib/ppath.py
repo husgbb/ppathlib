@@ -307,6 +307,8 @@ class PPath(os.PathLike[str]):
         if callable(attribute):
             def wrapped(*args: Any, **kwargs: Any) -> Any:
                 result = attribute(*_unwrap_value(args), **_unwrap_value(kwargs))
+                if name in {"iterdir", "glob", "rglob", "walk"}:
+                    return (self._wrap_result(item) for item in result)
                 return self._wrap_result(result)
 
             return wrapped

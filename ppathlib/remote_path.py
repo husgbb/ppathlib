@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from fnmatch import fnmatch
+import io
 import os
 import posixpath
 from pathlib import PurePosixPath
 from typing import Any, NoReturn, Optional, Union
 from urllib.parse import urlparse
+
+from obstore.store import AzureStore, GCSStore, S3Store
 
 from .exceptions import InvalidConfigurationException
 
@@ -89,12 +93,44 @@ class RemoteProfileClient:
 
     def create_store(self, uri: Optional[str] = None) -> Any:
         binding = self.binding_request(uri)
-        raise NotImplementedError(
-            f"RemoteProfileClient.create_store() is not implemented. "
-            f"Profile={binding.profile_name}. Storage type={binding.storage_type}. "
-            f"Root={binding.scope.raw_uri}. Required implementation: bind the abstract "
-            f"RemoteBindingRequest to a concrete store constructor in the runtime layer."
+        kwargs = dict(binding.connection_options)
+        prefix = binding.scope.prefix or None
+
+        if binding.storage_type == "s3":
+            return S3Store(binding.scope.container, prefix=prefix, **kwargs)
+        if binding.storage_type == "gs":
+            return GCSStore(binding.scope.container, prefix=prefix, **kwargs)
+        if binding.storage_type == "azure":
+            return AzureStore(binding.scope.container, prefix=prefix, **kwargs)
+
+        raise InvalidConfigurationException(
+            f"Unsupported storage type for remote store creation: {binding.storage_type}"
         )
+
+
+class _RemoteBytesWriter(io.BytesIO):
+    def __init__(self, store: Any, key: str) -> None:
+        super().__init__()
+        self._store = store
+        self._key = key
+
+    def close(self) -> None:
+        if not self.closed:
+            self._store.put(self._key, self.getvalue())
+        super().close()
+
+
+class _RemoteTextWriter(io.StringIO):
+    def __init__(self, store: Any, key: str, *, encoding: str, newline: Optional[str]) -> None:
+        super().__init__(newline=newline)
+        self._store = store
+        self._key = key
+        self._encoding = encoding
+
+    def close(self) -> None:
+        if not self.closed:
+            self._store.put(self._key, self.getvalue().encode(self._encoding))
+        super().close()
 
 
 class RemotePath(os.PathLike[str]):
@@ -238,122 +274,359 @@ class RemotePath(os.PathLike[str]):
         return PurePosixPath(candidate).match(pattern)
 
     def open(self, *args: Any, **kwargs: Any) -> Any:
-        self._not_implemented(
-            "open",
-            "bind this method to open_reader/open_writer, or to a local cache wrapper that "
-            "downloads before read and uploads on close for write modes",
-        )
+        mode = args[0] if args else kwargs.pop("mode", "r")
+        if args:
+            args = args[1:]
+
+        buffering = kwargs.pop("buffering", -1)
+        encoding = kwargs.pop("encoding", None) or "utf-8"
+        errors = kwargs.pop("errors", None)
+        newline = kwargs.pop("newline", None)
+
+        if args or kwargs:
+            raise NotImplementedError(
+                "PPath.open() supports only mode, buffering, encoding, errors, and newline "
+                "for remote mode in the current runtime slice."
+            )
+        if buffering not in (-1, 1):
+            raise NotImplementedError(
+                "PPath.open() does not implement custom buffering behavior for remote mode yet."
+            )
+        if errors not in (None, "strict"):
+            raise NotImplementedError(
+                "PPath.open() does not implement non-default error handling for remote mode yet."
+            )
+        if any(flag in mode for flag in ("a", "x", "+")):
+            raise NotImplementedError(
+                "PPath.open() does not implement append, exclusive creation, or read/write "
+                "modes for remote paths yet."
+            )
+
+        store = self._store()
+        key = self._store_key()
+
+        if "r" in mode:
+            payload = bytes(store.get(key).bytes())
+            if "b" in mode:
+                return io.BytesIO(payload)
+            return io.TextIOWrapper(io.BytesIO(payload), encoding=encoding, newline=newline)
+
+        if "w" in mode:
+            if "b" in mode:
+                return _RemoteBytesWriter(store, key)
+            return _RemoteTextWriter(store, key, encoding=encoding, newline=newline)
+
+        raise NotImplementedError(f"PPath.open() does not support mode={mode!r} for remote paths yet.")
 
     def read_text(self, *args: Any, **kwargs: Any) -> str:
-        self._not_implemented(
-            "read_text",
-            "load text bytes through the runtime reader interface and decode with the requested "
-            "encoding, errors, and newline semantics",
-        )
+        encoding = kwargs.pop("encoding", None) or "utf-8"
+        errors = kwargs.pop("errors", None) or "strict"
+        if args or kwargs:
+            raise NotImplementedError(
+                "PPath.read_text() supports only the `encoding` and `errors` arguments "
+                "for remote mode in the current runtime slice."
+            )
+        return self.read_bytes().decode(encoding, errors)
 
     def write_text(self, *args: Any, **kwargs: Any) -> int:
-        self._not_implemented(
-            "write_text",
-            "encode text exactly once and persist it through the runtime writer interface",
-        )
+        if not args:
+            raise TypeError("PPath.write_text() missing required argument: 'data'")
+        data = args[0]
+        if not isinstance(data, str):
+            raise TypeError("PPath.write_text() requires `data` to be str.")
+        encoding = kwargs.pop("encoding", None) or "utf-8"
+        errors = kwargs.pop("errors", None) or "strict"
+        if len(args) > 1 or kwargs:
+            raise NotImplementedError(
+                "PPath.write_text() supports only `data`, `encoding`, and `errors` for "
+                "remote mode in the current runtime slice."
+            )
+        payload = data.encode(encoding, errors)
+        self.write_bytes(payload)
+        return len(data)
 
     def read_bytes(self) -> bytes:
-        self._not_implemented(
-            "read_bytes",
-            "load object bytes through the runtime reader interface without materializing "
-            "local cache semantics yet",
-        )
+        return bytes(self._store().get(self._store_key()).bytes())
 
     def write_bytes(self, data: bytes) -> int:
-        self._not_implemented(
-            "write_bytes",
-            "persist bytes through the runtime writer interface and return the written byte count",
-        )
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise TypeError("PPath.write_bytes() requires a bytes-like object.")
+        payload = bytes(data)
+        self._store().put(self._store_key(), payload)
+        return len(payload)
 
     def exists(self, *, follow_symlinks: bool = True) -> bool:
-        self._not_implemented(
-            "exists",
-            "map portable existence checks to store head or list semantics for files and "
-            "directory-like prefixes",
-        )
+        return self.is_file() or self.is_dir()
 
     def is_file(self, *, follow_symlinks: bool = True) -> bool:
-        self._not_implemented(
-            "is_file",
-            "differentiate object keys from directory-like prefixes using head plus prefix "
-            "listing rules",
-        )
+        key = self._store_key()
+        if key == "" or self._raw_uri.endswith("/"):
+            return False
+        try:
+            self._store().head(key)
+            return True
+        except FileNotFoundError:
+            return False
 
     def is_dir(self, *, follow_symlinks: bool = True) -> bool:
-        self._not_implemented(
-            "is_dir",
-            "treat directory-like prefixes consistently across supported stores using list semantics",
-        )
+        key = self._store_key()
+        if key == "":
+            return True
+        result = self._list_result(self._directory_prefix())
+        return bool(result["common_prefixes"] or result["objects"])
 
     def iterdir(self):
-        self._not_implemented(
-            "iterdir",
-            "emit immediate children only, without recursion, using list_with_delimiter or "
-            "equivalent prefix filtering",
+        if not self.is_dir():
+            raise NotADirectoryError(str(self))
+
+        result = self._list_result(self._directory_prefix())
+        children = [
+            self._path_from_store_path(prefix)
+            for prefix in result["common_prefixes"]
+        ]
+        children.extend(
+            self._path_from_store_path(obj["path"])
+            for obj in result["objects"]
+            if obj["path"] != self._store_key().rstrip("/")
         )
+        children.sort()
+        return iter(children)
 
     def glob(self, pattern: PathLike, *, case_sensitive: Optional[bool] = None, recurse_symlinks: bool = False):
-        self._not_implemented(
-            "glob",
-            "combine lexical pathlib-style pattern matching with store-backed child listing "
-            "for the minimum required subtree",
-        )
+        if not self.is_dir():
+            raise NotADirectoryError(str(self))
+        pattern_text = os.fspath(pattern).replace("\\", "/")
+        if "/" not in pattern_text and "**" not in pattern_text:
+            matches = [
+                child
+                for child in self.iterdir()
+                if self._match_basename(child.name, pattern_text, case_sensitive=case_sensitive)
+            ]
+            return iter(matches)
+
+        matches = []
+        for candidate in self._recursive_candidates():
+            relative = candidate.relative_to(self).as_posix()
+            if self._match_relative_path(relative, pattern_text, case_sensitive=case_sensitive):
+                matches.append(candidate)
+        matches.sort()
+        return iter(matches)
 
     def rglob(self, pattern: PathLike, *, case_sensitive: Optional[bool] = None, recurse_symlinks: bool = False):
-        self._not_implemented(
-            "rglob",
-            "combine recursive store listing with pathlib-compatible pattern filtering",
-        )
+        if not self.is_dir():
+            raise NotADirectoryError(str(self))
+        pattern_text = os.fspath(pattern).replace("\\", "/")
+        matches = []
+        for candidate in self._recursive_candidates():
+            relative = candidate.relative_to(self).as_posix()
+            if "/" not in pattern_text and "**" not in pattern_text:
+                if self._match_basename(candidate.name, pattern_text, case_sensitive=case_sensitive):
+                    matches.append(candidate)
+                continue
+            if self._match_relative_path(relative, pattern_text, case_sensitive=case_sensitive):
+                matches.append(candidate)
+        matches.sort()
+        return iter(matches)
 
     def walk(self, top_down: bool = True, on_error: Any = None, follow_symlinks: bool = False):
-        self._not_implemented(
-            "walk",
-            "materialize a deterministic directory tree view from object prefixes and return "
-            "tuples compatible with pathlib.Path.walk()",
-        )
+        if not self.is_dir():
+            raise NotADirectoryError(str(self))
+
+        tree = self._walk_tree()
+
+        def emit(relative_dir: str):
+            node = tree.get(relative_dir, {"dirs": set(), "files": set()})
+            dirnames = sorted(node["dirs"])
+            filenames = sorted(node["files"])
+            current_path = self if relative_dir == "" else self.joinpath(*relative_dir.split("/"))
+            if top_down:
+                yield (current_path, dirnames, filenames)
+            for dirname in dirnames:
+                child_relative = f"{relative_dir}/{dirname}" if relative_dir else dirname
+                yield from emit(child_relative)
+            if not top_down:
+                yield (current_path, dirnames, filenames)
+
+        return emit("")
 
     def copy(self, target: PathLike) -> Any:
-        self._not_implemented(
-            "copy",
-            "support remote-to-remote copy through the runtime copy interface and define explicit "
-            "fallback behavior for remote-to-local and local-to-remote transfers",
-        )
+        target_path, target_key = self._resolve_remote_target(target, method="copy")
+        self._store().copy(self._store_key(), target_key, overwrite=True)
+        return target_path
 
     def move(self, target: PathLike) -> Any:
-        self._not_implemented(
-            "move",
-            "support remote-to-remote rename through the runtime rename interface and define "
-            "explicit fallback behavior when a direct rename is unavailable",
-        )
+        target_path, target_key = self._resolve_remote_target(target, method="move")
+        self._store().rename(self._store_key(), target_key, overwrite=True)
+        return target_path
 
     def rename(self, target: PathLike) -> Any:
-        self._not_implemented(
-            "rename",
-            "alias or specialize move semantics with pathlib-compatible return behavior",
-        )
+        return self.move(target)
 
     def replace(self, target: PathLike) -> Any:
-        self._not_implemented(
-            "replace",
-            "define overwrite semantics explicitly and map them to rename or copy-plus-delete",
-        )
+        target_path, target_key = self._resolve_remote_target(target, method="replace")
+        self._store().rename(self._store_key(), target_key, overwrite=True)
+        return target_path
 
     def unlink(self, missing_ok: bool = False) -> None:
-        self._not_implemented(
-            "unlink",
-            "delete a single object key through the runtime delete interface and implement "
-            "pathlib-compatible missing_ok behavior",
-        )
+        key = self._store_key()
+        if key == "":
+            raise IsADirectoryError(f"Remote root prefixes cannot be unlinked: {self}")
+        if not missing_ok and not self.exists():
+            raise FileNotFoundError(str(self))
+        self._store().delete(key)
 
     def _from_pure(self, pure: PurePosixPath) -> "RemotePath":
         lexical = pure.as_posix().lstrip("/")
         uri = f"{self.anchor}{lexical}" if lexical else self.anchor
         return type(self)(uri, client=self.client)
+
+    def _bucket_uri(self) -> str:
+        return f"{self.anchor}{self.drive}"
+
+    def _root_scope(self) -> Optional[RemoteScope]:
+        if self.client.root is None:
+            return None
+        return self.client.resolve_scope()
+
+    def _store(self) -> Any:
+        root_scope = self._root_scope()
+        if root_scope is not None:
+            return self.client.create_store()
+        return self.client.create_store(uri=self._bucket_uri())
+
+    def _store_key(self) -> str:
+        root_scope = self._root_scope()
+        if root_scope is None:
+            return self._key
+
+        root_prefix = root_scope.prefix.strip("/")
+        if not root_prefix:
+            return self._key
+        if self._key == root_prefix:
+            return ""
+        prefix_with_sep = root_prefix.rstrip("/") + "/"
+        if self._key.startswith(prefix_with_sep):
+            return self._key[len(prefix_with_sep) :]
+        raise InvalidConfigurationException(
+            f"Remote path {self} is outside the configured root {self.client.root}."
+        )
+
+    def _directory_prefix(self) -> str:
+        key = self._store_key().strip("/")
+        if key == "":
+            return ""
+        return key.rstrip("/") + "/"
+
+    def _list_result(self, prefix: str) -> dict[str, Any]:
+        result = self._store().list_with_delimiter(prefix=prefix or None)
+        return {
+            "common_prefixes": list(result.get("common_prefixes", [])),
+            "objects": list(result.get("objects", [])),
+        }
+
+    def _list_objects_recursive(self, prefix: str) -> list[dict[str, Any]]:
+        stream = self._store().list(prefix or None)
+        objects: list[dict[str, Any]] = []
+        for chunk in stream:
+            objects.extend(list(chunk))
+        return objects
+
+    def _path_from_store_path(self, store_path: str) -> "RemotePath":
+        normalized_store_path = store_path.strip("/")
+        root_scope = self._root_scope()
+        full_key = normalized_store_path
+        if root_scope is not None and root_scope.prefix.strip("/"):
+            full_key = f"{root_scope.prefix.strip('/')}/{normalized_store_path}" if normalized_store_path else root_scope.prefix.strip("/")
+        uri = f"{self.anchor}{self.drive}"
+        if full_key:
+            uri = f"{uri}/{full_key}"
+        return type(self)(uri, client=self.client)
+
+    def _recursive_candidates(self) -> list["RemotePath"]:
+        prefix = self._directory_prefix()
+        objects = self._list_objects_recursive(prefix)
+        directory_paths: set[str] = set()
+        file_paths: set[str] = set()
+
+        for obj in objects:
+            store_path = obj["path"].strip("/")
+            file_paths.add(store_path)
+            relative = store_path[len(prefix) :] if prefix and store_path.startswith(prefix) else store_path
+            parent_parts = relative.split("/")[:-1]
+            current_parts: list[str] = []
+            for part in parent_parts:
+                current_parts.append(part)
+                directory_paths.add(f"{prefix}{'/'.join(current_parts)}".strip("/"))
+
+        candidates = [self._path_from_store_path(path) for path in sorted(directory_paths | file_paths)]
+        candidates.sort()
+        return candidates
+
+    def _match_basename(self, name: str, pattern: str, *, case_sensitive: Optional[bool]) -> bool:
+        if case_sensitive is False:
+            return fnmatch(name.lower(), pattern.lower())
+        return fnmatch(name, pattern)
+
+    def _match_relative_path(self, relative_path: str, pattern: str, *, case_sensitive: Optional[bool]) -> bool:
+        candidate = PurePosixPath(relative_path)
+        if case_sensitive is False:
+            candidate = PurePosixPath(relative_path.lower())
+            pattern = pattern.lower()
+        return candidate.match(pattern)
+
+    def _walk_tree(self) -> dict[str, dict[str, set[str]]]:
+        prefix = self._directory_prefix()
+        tree: dict[str, dict[str, set[str]]] = {
+            "": {"dirs": set(), "files": set()},
+        }
+        for obj in self._list_objects_recursive(prefix):
+            store_path = obj["path"].strip("/")
+            relative = store_path[len(prefix) :] if prefix and store_path.startswith(prefix) else store_path
+            parts = [part for part in relative.split("/") if part]
+            if not parts:
+                continue
+
+            current = ""
+            for dirname in parts[:-1]:
+                tree.setdefault(current, {"dirs": set(), "files": set()})
+                tree[current]["dirs"].add(dirname)
+                current = f"{current}/{dirname}" if current else dirname
+                tree.setdefault(current, {"dirs": set(), "files": set()})
+
+            tree.setdefault(current, {"dirs": set(), "files": set()})
+            tree[current]["files"].add(parts[-1])
+
+        return tree
+
+    def _resolve_remote_target(self, target: PathLike, *, method: str) -> tuple["RemotePath", str]:
+        if not isinstance(target, RemotePath):
+            target_text = os.fspath(target)
+            if not self._is_remote_target_text(target_text):
+                self._not_implemented(
+                    method,
+                    "support remote-to-local and local-to-remote transfers explicitly before "
+                    "accepting non-remote targets",
+                )
+            target = type(self)(target_text, client=self.client)
+
+        if target.anchor != self.anchor:
+            self._not_implemented(
+                method,
+                "support cross-scheme remote transfers explicitly before accepting targets "
+                "outside the source scheme",
+            )
+        if target.drive != self.drive:
+            self._not_implemented(
+                method,
+                "support cross-bucket or cross-container remote transfers explicitly before "
+                "accepting targets outside the source store scope",
+            )
+
+        return target, target._store_key()
+
+    def _is_remote_target_text(self, target: str) -> bool:
+        parsed = urlparse(target)
+        return bool(parsed.scheme and parsed.netloc)
 
     def _not_implemented(self, method: str, required_implementation: str) -> NoReturn:
         raise NotImplementedError(

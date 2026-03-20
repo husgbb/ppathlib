@@ -34,6 +34,22 @@ def test_live_r2_round_trip_uses_project_root_configuration(monkeypatch):
     data_dir = PPath("live-tests", profile="r2_live")
     input_path = data_dir / "source/input.csv"
     output_path = data_dir / "output/pred.csv"
+    copy_path = data_dir / "copies/input-copy.csv"
+    moved_path = data_dir / "moved/input-moved.csv"
+    renamed_path = data_dir / "renamed/input-renamed.csv"
+    replaced_path = data_dir / "replaced/input.csv"
+    paths_to_clean = [
+        input_path,
+        output_path,
+        copy_path,
+        moved_path,
+        renamed_path,
+        replaced_path,
+    ]
+
+    for path in paths_to_clean:
+        if path.exists():
+            path.unlink()
 
     source = pd.DataFrame({"id": [1], "value": [10]})
     with input_path.open("w", encoding="utf-8", newline="") as handle:
@@ -51,6 +67,39 @@ def test_live_r2_round_trip_uses_project_root_configuration(monkeypatch):
             {"id": 1, "value": 10, "prediction": 20}
         ]
 
-    output_path.unlink()
+    assert data_dir.is_dir() is True
+    assert input_path.is_file() is True
+    assert output_path.is_file() is True
+    assert sorted(path.name for path in data_dir.iterdir()) == ["output", "source"]
+    assert sorted(str(path) for path in data_dir.rglob("*.csv")) == [
+        "s3://ppath-dev/live-tests/output/pred.csv",
+        "s3://ppath-dev/live-tests/source/input.csv",
+    ]
 
+    copied = input_path.copy(copy_path)
+    assert copied == copy_path
+    assert copy_path.exists() is True
+
+    moved = copy_path.move(moved_path)
+    assert moved == moved_path
+    assert copy_path.exists() is False
+    assert moved_path.exists() is True
+
+    renamed = moved_path.rename(renamed_path)
+    assert renamed == renamed_path
+    assert moved_path.exists() is False
+    assert renamed_path.exists() is True
+
+    replaced_path.write_text("old")
+    replaced = renamed_path.replace(replaced_path)
+    assert replaced == replaced_path
+    assert renamed_path.exists() is False
+    assert replaced_path.read_text() == "id,value\n1,10\n"
+
+    input_path.unlink()
+    output_path.unlink()
+    replaced_path.unlink()
+
+    assert input_path.exists() is False
     assert output_path.exists() is False
+    assert replaced_path.exists() is False
