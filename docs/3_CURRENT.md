@@ -1,0 +1,7 @@
+- `ppathlib` is being developed through harness engineering rather than feature-first implementation.
+- Harness engineering here means making the intended contract explicit so implementation stays subordinate to documented intent throughout the development lifecycle.
+- The harness exists to reduce ambiguity, prevent accidental design drift, and keep implementation subordinate to documented intent.
+- Development order is: philosophy, decisions, standard, tests, runtime code.
+- These notes describe the current operating emphasis, not a separate lifecycle stage. Prefer abstract interfaces, deterministic lexical behavior, exact placeholder errors, and tests.
+- If behavior is not implemented, fail explicitly instead of guessing.
+- Backend notes may mention `obstore`, but public path naming and contracts must stay backend-neutral.

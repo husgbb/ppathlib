@@ -1,18 +1,34 @@
 # ppathlib
 
-`ppathlib` is a path interface for local files and named remote storage.
+`ppathlib` is currently in a remote-path prototype rewrite.
 
-It behaves like `pathlib.Path` when no `profile` is provided, and it switches to remote mode when a `profile` is given. A profile maps to environment variables that define a backend such as S3, GCS, or Azure Blob Storage, plus an optional default `ROOT`. SFTP and WebDAV support are planned `(coming soon)`.
+The current prototype has two modes:
 
-The main examples in this README use S3 because that is the most familiar starting point for most users. The same model also works for other supported remotes.
+- `PPath(path)` returns `pathlib.Path`
+- `PPath(path, profile=...)` returns a `RemotePath` prototype object
 
-## Why ppathlib
+## Prototype Status
 
-- Use one path API for both local and remote storage
-- Keep remote access explicit with named profiles
-- Avoid process-global provider credential variables
-- Support relative paths against a configured remote `ROOT`
-- Reuse the same profile across pandas and pyarrow workflows
+The current remote-path implementation is not feature-complete.
+
+Working now:
+
+- profile resolution
+- profile-bound binding request construction
+- local mode
+- remote lexical path behavior such as `/`, `joinpath`, `name`, `stem`, `suffix`, `parent`, `parts`, `relative_to`, `with_suffix`
+- explicit placeholder errors for deferred remote I/O
+- documentation governance through `docs/PHILOSOPHY.md`, `docs/STANDARD.md`, and `docs/DECISIONS.md`
+
+Deferred:
+
+- actual backend-backed remote reads and writes
+- remote listing and globbing
+- remote copy and move
+- bucket or container root listing
+- stdlib monkey-patch compatibility helpers
+
+The source of truth for the harness stage is the three-layer documentation set in `docs/`.
 
 ## Installation
 
@@ -20,108 +36,66 @@ The main examples in this README use S3 because that is the most familiar starti
 pip install ppathlib
 ```
 
-For parquet workflows you will typically also want:
-
-```bash
-pip install pandas pyarrow
-```
+When remote behavior starts being implemented, the first backend runtime is expected to use `obstore` as an optional dependency.
 
 ## Quick Start
 
 ### Local Mode
 
-If `profile` is omitted, `PPath(...)` behaves like `pathlib.Path(...)`.
-
 ```python
 from ppathlib import PPath
 
 path = PPath("data/local-report.parquet")
+assert path.read_text if hasattr(path, "read_text") else True
 ```
 
 ### Remote Mode
 
-Define a named remote with a stable profile name:
+```toml
+version = 1
 
-```bash
-export MY_RESEARCH_BUCKET_STORAGE_TYPE=s3
-export MY_RESEARCH_BUCKET_ENDPOINT_URL=https://s3.ap-northeast-2.amazonaws.com
-export MY_RESEARCH_BUCKET_ACCESS_KEY_ID=xxx
-export MY_RESEARCH_BUCKET_SECRET_ACCESS_KEY=yyy
-export MY_RESEARCH_BUCKET_REGION=ap-northeast-2
-export MY_RESEARCH_BUCKET_ROOT=s3://analytics-bucket
+[profiles.my_remote]
+storage_type = "s3"
+endpoint_url = "https://storage.example.com"
+access_key_id = "xxx"
+secret_access_key = "yyy"
+root = "s3://analytics-bucket"
 ```
-
-Use a relative path against that remote root:
 
 ```python
 from ppathlib import PPath
 
-path = PPath("daily/report.parquet", profile="MY_RESEARCH_BUCKET")
-
-with path.open("rb") as f:
-    payload = f.read()
+path = PPath("daily/report.parquet", profile="MY_REMOTE")
+print(path)
+print(path.name)
+print(path.with_suffix(".csv"))
 ```
 
-You can also pass a full remote URI:
+At the current prototype stage, remote I/O methods such as `open()` are placeholders and will raise explicit implementation errors.
+The profile client can resolve remote scope and emit an abstract binding request, but it does not construct concrete runtime stores yet.
+URIs ending with `/`, such as `s3://bucket/a/`, are treated as directory-like prefixes by contract.
+Configuration is intended to come from `.ppathlib.toml` discovery in the project tree, with `~/.config/ppathlib/.ppathlib.toml` as the user-level fallback.
 
-```python
-from ppathlib import PPath
-
-path = PPath(
-    "s3://analytics-bucket/daily/report.parquet",
-    profile="MY_RESEARCH_BUCKET",
-)
-```
-
-## Core Behavior
-
-```python
-from ppathlib import PPath
-```
-
-- `PPath("data/file.parquet")`
-  - local mode
-- `PPath("daily/report.parquet", profile="MY_RESEARCH_BUCKET")`
-  - remote mode with `<PROFILE>_ROOT`
-- `PPath("s3://bucket/file.parquet", profile="MY_RESEARCH_BUCKET")`
-  - remote mode with an explicit URI
-- `PPath("s3://bucket/file.parquet")`
-  - error, because remote URIs require a profile
-
-## Example Usage
-
-```python
-import pandas as pd
-from ppathlib import PPath
-
-src = PPath("in.parquet", profile="MY_RESEARCH_BUCKET")
-dst = PPath("out.parquet", profile="MY_RESEARCH_BUCKET")
-
-df = pd.read_parquet(src)
-df.to_parquet(dst)
-```
-
-## API
+## Current API Surface
 
 ### `PPath(path, profile=None)`
 
-Creates either:
-
-- a local path when `profile` is omitted
-- a remote path when `profile` is provided
+- if `profile` is omitted, returns `pathlib.Path`
+- if `profile` is provided, returns `RemotePath`
 
 ### `get_client(profile)`
 
-Returns the cached client for a named remote.
+Returns the cached prototype profile client for a named remote.
 
 ### `clear_client_cache()`
 
-Clears the internal client registry.
+Clears the internal profile-client registry.
 
 ## Documentation
 
-- [Configuration](docs/configuration.md)
-- [Backends and Examples](docs/backends.md)
+- [Philosophy](docs/PHILOSOPHY.md)
+- [Standard](docs/STANDARD.md)
+- [Decisions](docs/DECISIONS.md)
 
 ## License
 

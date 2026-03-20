@@ -6,15 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional, Union
 
-from .azure.azblobclient import AzureBlobClient
-from .azure.azblobpath import AzureBlobPath
-from .cloudpath import implementation_registry
-from .enums import FileCacheMode
-from .exceptions import InvalidConfigurationException, MissingDependenciesError
-from .gs.gsclient import GSClient
-from .gs.gspath import GSPath
-from .s3.s3client import S3Client
-from .s3.s3path import S3Path
+from .exceptions import InvalidConfigurationException
+from .remote_path import RemotePath, RemoteProfileClient
 
 
 _PROFILE_TOKEN_RE = re.compile(r"[^0-9A-Za-z]+")
@@ -26,11 +19,69 @@ class _ResolvedProfile:
     normalized_name: str
     storage_type: str
     root: Optional[str]
-    path_class: type
     client_kwargs: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class _ProfileSpec:
+    canonical_storage_type: str
+    uri_scheme: str
+    required_env_keys: tuple[str, ...] = ()
+    optional_env_keys: tuple[str, ...] = ()
+    unsupported_env_keys: tuple[str, ...] = ()
+    env_key_renames: tuple[tuple[str, str], ...] = ()
+
+
 _CLIENT_CACHE: dict[tuple[Any, ...], Any] = {}
+_STORAGE_TYPE_ALIASES = {
+    "s3": "s3",
+    "gs": "gs",
+    "gcs": "gs",
+    "azure": "azure",
+    "az": "azure",
+    "azblob": "azure",
+}
+_PROFILE_SPECS = {
+    "s3": _ProfileSpec(
+        canonical_storage_type="s3",
+        uri_scheme="s3",
+        optional_env_keys=(
+            "ACCESS_KEY_ID",
+            "SECRET_ACCESS_KEY",
+            "ENDPOINT_URL",
+            "SESSION_TOKEN",
+            "REGION",
+            "NO_SIGN_REQUEST",
+        ),
+        env_key_renames=(
+            ("ACCESS_KEY_ID", "access_key_id"),
+            ("SECRET_ACCESS_KEY", "secret_access_key"),
+            ("SESSION_TOKEN", "session_token"),
+            ("ENDPOINT_URL", "endpoint_url"),
+            ("REGION", "region"),
+            ("NO_SIGN_REQUEST", "no_sign_request"),
+        ),
+    ),
+    "gs": _ProfileSpec(
+        canonical_storage_type="gs",
+        uri_scheme="gs",
+        required_env_keys=("CREDENTIALS_JSON",),
+        unsupported_env_keys=("PROJECT", "STORAGE_CLIENT_JSON"),
+        env_key_renames=(
+            ("CREDENTIALS_JSON", "credentials_json"),
+        ),
+    ),
+    "azure": _ProfileSpec(
+        canonical_storage_type="azure",
+        uri_scheme="az",
+        optional_env_keys=("ACCOUNT_URL", "ACCOUNT_KEY"),
+        unsupported_env_keys=("CONNECTION_STRING", "TENANT_ID", "CLIENT_ID", "CLIENT_SECRET"),
+        env_key_renames=(
+            ("ACCOUNT_URL", "account_url"),
+            ("ACCOUNT_KEY", "account_key"),
+        ),
+    ),
+}
 
 
 def _normalize_profile_name(profile: str) -> str:
@@ -79,15 +130,7 @@ def _parse_bool(profile: str, key: str, env: Mapping[str, str]) -> Optional[bool
 
 def _canonical_storage_type(storage_type: str) -> str:
     lowered = storage_type.strip().lower()
-    aliases = {
-        "s3": "s3",
-        "gs": "gs",
-        "gcs": "gs",
-        "azure": "azure",
-        "az": "azure",
-        "azblob": "azure",
-    }
-    canonical = aliases.get(lowered)
+    canonical = _STORAGE_TYPE_ALIASES.get(lowered)
     if canonical is None:
         raise InvalidConfigurationException(f"Unsupported storage type for PPath prototype: {storage_type}")
     return canonical
@@ -114,137 +157,51 @@ def _join_remote_uri(base_uri: str, *parts: str) -> str:
     return f"{base_uri.rstrip('/')}/{'/'.join(cleaned_parts)}"
 
 
-def _build_s3_client(client_kwargs: Mapping[str, Any]) -> S3Client:
-    implementation_registry["s3"].validate_completeness()
-
-    from .s3 import s3client as s3client_module
-
-    session_factory = getattr(s3client_module, "Session", None)
-    if session_factory is None:
-        raise MissingDependenciesError(
-            "Missing dependencies for S3Client. Install with `pip install ppathlib[s3]`."
-        )
-
-    session_kwargs = {
-        "aws_access_key_id": client_kwargs.get("aws_access_key_id"),
-        "aws_secret_access_key": client_kwargs.get("aws_secret_access_key"),
-        "aws_session_token": client_kwargs.get("aws_session_token"),
-        "region_name": client_kwargs.get("region_name"),
-    }
-    session_kwargs = {key: value for key, value in session_kwargs.items() if value is not None}
-
-    return S3Client(
-        boto3_session=session_factory(**session_kwargs),
-        endpoint_url=client_kwargs.get("endpoint_url"),
-        no_sign_request=bool(client_kwargs.get("no_sign_request", False)),
-        file_cache_mode=client_kwargs.get("file_cache_mode"),
-        local_cache_dir=client_kwargs.get("local_cache_dir"),
-    )
-
-
-def _build_gs_client(client_kwargs: Mapping[str, Any]) -> GSClient:
-    implementation_registry["gs"].validate_completeness()
-    return GSClient(**client_kwargs)
-
-
-def _build_azure_client(client_kwargs: Mapping[str, Any]) -> AzureBlobClient:
-    implementation_registry["azure"].validate_completeness()
-    return AzureBlobClient(**client_kwargs)
-
-
-def _resolve_cache_settings(profile: str, env: Mapping[str, str]) -> dict[str, Any]:
-    settings: dict[str, Any] = {}
-
-    cache_dir = _get_env(profile, "CACHE_DIR", env)
-    if cache_dir is not None:
-        settings["local_cache_dir"] = str(Path(cache_dir) / profile)
-
-    cache_mode = _get_env(profile, "CACHE_MODE", env)
-    if cache_mode is not None:
-        try:
-            settings["file_cache_mode"] = FileCacheMode(cache_mode.strip().lower())
-        except ValueError as exc:
+def _resolve_backend_settings(profile: str, env: Mapping[str, str], spec: _ProfileSpec) -> dict[str, Any]:
+    for env_key in spec.unsupported_env_keys:
+        if _get_env(profile, env_key, env) is not None:
             raise InvalidConfigurationException(
-                f"Invalid cache mode for {_profile_env_name(profile, 'CACHE_MODE')}: {cache_mode}"
-            ) from exc
+                f"{_profile_env_name(profile, env_key)} is not supported by this prototype."
+            )
 
-    return settings
+    raw_values: dict[str, Any] = {}
 
+    for env_key in spec.required_env_keys:
+        raw_values[env_key] = _get_env(profile, env_key, env, required=True)
 
-def _resolve_s3_profile(profile: str, env: Mapping[str, str]) -> _ResolvedProfile:
-    no_sign_request = _parse_bool(profile, "NO_SIGN_REQUEST", env) or False
+    for env_key in spec.optional_env_keys:
+        raw_values[env_key] = _get_env(profile, env_key, env)
 
-    client_kwargs = {
-        "endpoint_url": _get_env(profile, "ENDPOINT_URL", env),
-        "aws_access_key_id": _get_env(profile, "ACCESS_KEY_ID", env, required=not no_sign_request),
-        "aws_secret_access_key": _get_env(
-            profile,
-            "SECRET_ACCESS_KEY",
-            env,
-            required=not no_sign_request,
-        ),
-        "aws_session_token": _get_env(profile, "SESSION_TOKEN", env),
-        "region_name": _get_env(profile, "REGION", env),
-        "no_sign_request": no_sign_request,
-    }
-    client_kwargs.update(_resolve_cache_settings(profile, env))
+    if "NO_SIGN_REQUEST" in raw_values and raw_values["NO_SIGN_REQUEST"] is not None:
+        raw_values["NO_SIGN_REQUEST"] = _parse_bool(profile, "NO_SIGN_REQUEST", env)
 
-    return _ResolvedProfile(
-        normalized_name=profile,
-        storage_type="s3",
-        root=_get_env(profile, "ROOT", env),
-        path_class=S3Path,
-        client_kwargs=client_kwargs,
-    )
+    if spec.canonical_storage_type == "s3":
+        no_sign_request = bool(raw_values.get("NO_SIGN_REQUEST") or False)
+        raw_values["NO_SIGN_REQUEST"] = no_sign_request
+        if not no_sign_request:
+            raw_values["ACCESS_KEY_ID"] = _get_env(profile, "ACCESS_KEY_ID", env, required=True)
+            raw_values["SECRET_ACCESS_KEY"] = _get_env(
+                profile,
+                "SECRET_ACCESS_KEY",
+                env,
+                required=True,
+            )
 
+    if spec.canonical_storage_type == "gs":
+        raw_values["CREDENTIALS_JSON"] = _get_env(profile, "CREDENTIALS_JSON", env, required=True)
 
-def _resolve_gs_profile(profile: str, env: Mapping[str, str]) -> _ResolvedProfile:
-    client_kwargs = {
-        "project": _get_env(profile, "PROJECT", env, required=True),
-        "application_credentials": _get_env(profile, "CREDENTIALS_JSON", env, required=True),
-    }
-    client_kwargs.update(_resolve_cache_settings(profile, env))
+    if spec.canonical_storage_type == "azure":
+        raw_values["ACCOUNT_URL"] = _get_env(profile, "ACCOUNT_URL", env, required=True)
+        raw_values["ACCOUNT_KEY"] = _get_env(profile, "ACCOUNT_KEY", env, required=True)
 
-    if _get_env(profile, "STORAGE_CLIENT_JSON", env) is not None:
-        raise InvalidConfigurationException(
-            f"{_profile_env_name(profile, 'STORAGE_CLIENT_JSON')} is not supported by this prototype."
-        )
+    resolved: dict[str, Any] = {}
+    rename_map = dict(spec.env_key_renames)
+    for env_key, value in raw_values.items():
+        if value is None:
+            continue
+        resolved[rename_map.get(env_key, env_key.lower())] = value
 
-    return _ResolvedProfile(
-        normalized_name=profile,
-        storage_type="gs",
-        root=_get_env(profile, "ROOT", env),
-        path_class=GSPath,
-        client_kwargs=client_kwargs,
-    )
-
-
-def _resolve_azure_profile(profile: str, env: Mapping[str, str]) -> _ResolvedProfile:
-    client_secret = _get_env(profile, "CLIENT_SECRET", env)
-    tenant_id = _get_env(profile, "TENANT_ID", env)
-    client_id = _get_env(profile, "CLIENT_ID", env)
-
-    if any(value is not None for value in (client_secret, tenant_id, client_id)):
-        raise InvalidConfigurationException(
-            f"Service principal auth is not supported by this PPath prototype for profile {profile}."
-        )
-
-    connection_string = _get_env(profile, "CONNECTION_STRING", env)
-    if connection_string is not None:
-        client_kwargs = {"connection_string": connection_string}
-    else:
-        account_url = _get_env(profile, "ACCOUNT_URL", env, required=True)
-        account_key = _get_env(profile, "ACCOUNT_KEY", env, required=True)
-        client_kwargs = {"account_url": account_url, "credential": account_key}
-    client_kwargs.update(_resolve_cache_settings(profile, env))
-
-    return _ResolvedProfile(
-        normalized_name=profile,
-        storage_type="azure",
-        root=_get_env(profile, "ROOT", env),
-        path_class=AzureBlobPath,
-        client_kwargs=client_kwargs,
-    )
+    return resolved
 
 
 def _resolve_profile(profile: str, env: Optional[Mapping[str, str]] = None) -> _ResolvedProfile:
@@ -253,36 +210,40 @@ def _resolve_profile(profile: str, env: Optional[Mapping[str, str]] = None) -> _
     storage_type = _canonical_storage_type(
         _get_env(normalized_name, "STORAGE_TYPE", effective_env, required=True) or ""
     )
+    spec = _PROFILE_SPECS[storage_type]
 
-    if storage_type == "s3":
-        return _resolve_s3_profile(normalized_name, effective_env)
-    if storage_type == "gs":
-        return _resolve_gs_profile(normalized_name, effective_env)
-    if storage_type == "azure":
-        return _resolve_azure_profile(normalized_name, effective_env)
-
-    raise InvalidConfigurationException(f"Unsupported storage type for PPath prototype: {storage_type}")
+    return _ResolvedProfile(
+        normalized_name=normalized_name,
+        storage_type=spec.canonical_storage_type,
+        root=_get_env(normalized_name, "ROOT", effective_env),
+        client_kwargs=_resolve_backend_settings(normalized_name, effective_env, spec),
+    )
 
 
 def _get_client_for_resolved_profile(resolved: _ResolvedProfile) -> Any:
-    cache_key = (resolved.storage_type, _freeze(resolved.client_kwargs))
+    cache_key = (
+        resolved.normalized_name,
+        resolved.storage_type,
+        resolved.root,
+        _freeze(resolved.client_kwargs),
+    )
     cached = _CLIENT_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
-    if resolved.storage_type == "s3":
-        client = _build_s3_client(resolved.client_kwargs)
-    elif resolved.storage_type == "gs":
-        client = _build_gs_client(resolved.client_kwargs)
-    elif resolved.storage_type == "azure":
-        client = _build_azure_client(resolved.client_kwargs)
-    else:
-        raise InvalidConfigurationException(
-            f"Unsupported storage type for PPath prototype: {resolved.storage_type}"
-        )
+    client = RemoteProfileClient(
+        profile_name=resolved.normalized_name,
+        storage_type=resolved.storage_type,
+        root=resolved.root,
+        client_kwargs=dict(resolved.client_kwargs),
+    )
 
     _CLIENT_CACHE[cache_key] = client
     return client
+
+
+def _scheme_for_storage_type(storage_type: str) -> str:
+    return _PROFILE_SPECS[storage_type].uri_scheme
 
 
 def _resolve_remote_path(
@@ -294,9 +255,11 @@ def _resolve_remote_path(
     raw_parts = tuple(os.fspath(part) for part in parts)
 
     if _is_remote_uri(raw_path):
-        if not resolved.path_class.is_valid_cloudpath(raw_path, raise_on_error=False):
+        expected_scheme = _scheme_for_storage_type(resolved.storage_type)
+        actual_scheme = raw_path.split("://", 1)[0].lower()
+        if actual_scheme != expected_scheme:
             raise InvalidConfigurationException(
-                f"Profile {resolved.normalized_name} expects {resolved.path_class.cloud_prefix} paths: {raw_path}"
+                f"Profile {resolved.normalized_name} expects {expected_scheme}:// paths: {raw_path}"
             )
 
         return _join_remote_uri(raw_path, *raw_parts)
@@ -336,4 +299,4 @@ def PPath(
 
     resolved = _resolve_profile(profile)
     remote_path = _resolve_remote_path(path, parts, resolved)
-    return resolved.path_class(remote_path, client=_get_client_for_resolved_profile(resolved))
+    return RemotePath(remote_path, client=_get_client_for_resolved_profile(resolved))

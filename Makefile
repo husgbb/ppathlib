@@ -1,4 +1,4 @@
-.PHONY: clean clean-pyc clean-test clean-build dist format install lint release release-test reqs test test-debug help
+.PHONY: clean clean-pyc clean-test clean-build dist format install lint reqs test test-debug help
 .DEFAULT_GOAL := help
 
 define PRINT_HELP_PYSCRIPT
@@ -28,7 +28,6 @@ clean-pyc: ## remove Python file artifacts
 	find . -path ./.venv -prune -o -name '__pycache__' -exec rm -fr {} +
 
 clean-test: ## remove test and coverage artifacts
-	rm -fr .tox/
 	rm -f .coverage
 	rm -fr htmlcov/
 	rm -fr .pytest_cache
@@ -37,8 +36,9 @@ dist: clean ## build source and wheel package
 	uv run python -m build
 	ls -l dist
 
-format:  ## run black to format codebase
-	uv run black ppathlib tests ppath_tests
+format:  ## run formatters
+	uv run black ppathlib ppath_tests
+	uv run ruff format ppathlib ppath_tests
 
 help:
 	@python3 -c "$$PRINT_HELP_PYSCRIPT" < $(MAKEFILE_LIST)
@@ -46,16 +46,10 @@ help:
 install: clean ## install the package to the active Python's site-packages
 	uv sync
 
-lint: ## check style with black, flake8, and mypy
-	uv run black --check ppathlib tests ppath_tests
-	uv run flake8 ppathlib tests ppath_tests
+lint: ## check style with black, ruff, and mypy
+	uv run black --check ppathlib ppath_tests
+	uv run ruff check ppathlib ppath_tests
 	uv run mypy ppathlib
-
-release: dist ## package and upload a release
-	twine upload dist/*
-
-release-test: dist
-	twine upload --repository pypitest dist/*
 
 reqs:  ## install development requirements
 	uv sync
@@ -64,4 +58,4 @@ test: ## run tests
 	uv run pytest -vv
 
 test-debug:  ## rerun tests that failed in last run and stop with pdb at failures
-	uv run pytest -n=0 -vv --lf --pdb
+	uv run pytest -vv --lf --pdb
