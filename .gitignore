@@ -7,6 +7,7 @@ __pycache__/
 .ppathlib.toml
 .venv/
 venv/
+uv.lock
 
 # Build artifacts
 build/
