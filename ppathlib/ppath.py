@@ -160,24 +160,26 @@ def _lookup_profile_table(profiles: Mapping[str, Any], profile: str) -> Optional
     return None
 
 
-def _resolve_profile(profile: str) -> _ResolvedProfile:
+def _lookup_profile_key(profiles: Mapping[str, Any], profile: str) -> Optional[str]:
+    requested = profile.casefold()
+    for key in profiles:
+        if key.casefold() == requested:
+            return key
+    return None
+
+
+def _serialize_profile_data(resolved: _ResolvedProfile) -> dict[str, Any]:
+    data: dict[str, Any] = {"storage_type": resolved.storage_type}
+    if resolved.root is not None:
+        data["root"] = resolved.root
+    data.update(resolved.client_kwargs)
+    return data
+
+
+def _resolved_profile_from_table(profile: str, raw_profile: Mapping[str, Any]) -> _ResolvedProfile:
     display_name = profile.strip()
     if not display_name:
         raise InvalidConfigurationException("`profile` must not be empty.")
-
-    config_path = _discover_config_path()
-    if config_path is None:
-        raise InvalidConfigurationException(
-            f"Profile {display_name} could not be resolved because no {_CONFIG_FILENAME} file was found."
-        )
-
-    document = _load_config_document(config_path)
-    profiles = _profiles_table(document, config_path)
-    raw_profile = _lookup_profile_table(profiles, display_name)
-    if raw_profile is None:
-        raise InvalidConfigurationException(
-            f"Profile {display_name} was not found in configuration file: {config_path}"
-        )
 
     storage_type_value = raw_profile.get("storage_type")
     if not isinstance(storage_type_value, str) or not storage_type_value.strip():
@@ -228,6 +230,27 @@ def _resolve_profile(profile: str) -> _ResolvedProfile:
     )
 
 
+def _resolve_profile(profile: str) -> _ResolvedProfile:
+    display_name = profile.strip()
+    if not display_name:
+        raise InvalidConfigurationException("`profile` must not be empty.")
+
+    config_path = _discover_config_path()
+    if config_path is None:
+        raise InvalidConfigurationException(
+            f"Profile {display_name} could not be resolved because no {_CONFIG_FILENAME} file was found."
+        )
+
+    document = _load_config_document(config_path)
+    profiles = _profiles_table(document, config_path)
+    raw_profile = _lookup_profile_table(profiles, display_name)
+    if raw_profile is None:
+        raise InvalidConfigurationException(
+            f"Profile {display_name} was not found in configuration file: {config_path}"
+        )
+    return _resolved_profile_from_table(display_name, raw_profile)
+
+
 def _public_profile_for_uri(uri: str) -> _ResolvedProfile:
     storage_type = _validate_remote_uri(uri, allow_public=True)
     client_kwargs: dict[str, Any] = {}
@@ -263,6 +286,120 @@ def _get_client_for_resolved_profile(resolved: _ResolvedProfile) -> RemoteProfil
     return client
 
 
+def _config_path_for_write() -> Path:
+    config_path = _discover_config_path()
+    if config_path is not None:
+        return config_path
+    return _global_config_path()
+
+
+def _toml_format_key(key: str) -> str:
+    if key.replace("_", "").replace("-", "").isalnum() and key:
+        return key
+    escaped = key.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _toml_format_string(value: str) -> str:
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\b", "\\b")
+        .replace("\t", "\\t")
+        .replace("\n", "\\n")
+        .replace("\f", "\\f")
+        .replace("\r", "\\r")
+    )
+    return f'"{escaped}"'
+
+
+def _toml_format_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return _toml_format_string(value)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_format_value(item) for item in value) + "]"
+    raise InvalidConfigurationException(
+        f"Unsupported profile configuration value type for TOML serialization: {type(value).__name__}"
+    )
+
+
+def _dump_config_document(document: Mapping[str, Any]) -> str:
+    scalar_lines: list[str] = []
+    table_chunks: list[str] = []
+
+    for key, value in document.items():
+        if isinstance(value, Mapping):
+            if key == "profiles":
+                profiles_lines: list[str] = []
+                for profile_name, profile_value in value.items():
+                    if not isinstance(profile_value, Mapping):
+                        raise InvalidConfigurationException(
+                            f"Profile {profile_name} must be a TOML table."
+                        )
+                    profiles_lines.append(
+                        f"[profiles.{_toml_format_key(profile_name)}]"
+                    )
+                    for field_name, field_value in profile_value.items():
+                        profiles_lines.append(
+                            f"{_toml_format_key(field_name)} = {_toml_format_value(field_value)}"
+                        )
+                    profiles_lines.append("")
+                if profiles_lines:
+                    table_chunks.append("\n".join(profiles_lines).rstrip())
+                continue
+
+            raise InvalidConfigurationException(
+                f"Unsupported nested TOML table in configuration document: {key}"
+            )
+
+        scalar_lines.append(f"{_toml_format_key(key)} = {_toml_format_value(value)}")
+
+    chunks = [chunk for chunk in ["\n".join(scalar_lines).rstrip(), *table_chunks] if chunk]
+    if not chunks:
+        return ""
+    return "\n\n".join(chunks) + "\n"
+
+
+def _save_profile_connection_params(profile: str, params: Mapping[str, Any]) -> _ResolvedProfile:
+    resolved = _resolved_profile_from_table(profile, params)
+    config_path = _config_path_for_write()
+
+    if config_path.is_file():
+        document = _load_config_document(config_path)
+    else:
+        document = {"version": 1}
+
+    if not isinstance(document, dict):
+        raise InvalidConfigurationException(
+            f"Configuration document must be a TOML table: {config_path}"
+        )
+
+    profiles_value = document.get("profiles")
+    if profiles_value is None:
+        profiles: dict[str, Any] = {}
+    elif isinstance(profiles_value, Mapping):
+        profiles = dict(profiles_value)
+    else:
+        raise InvalidConfigurationException(
+            f"`profiles` must be a TOML table in configuration file: {config_path}"
+        )
+
+    existing_key = _lookup_profile_key(profiles, resolved.display_name)
+    target_key = existing_key or resolved.display_name
+    profiles[target_key] = _serialize_profile_data(resolved)
+    document["profiles"] = profiles
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(_dump_config_document(document), encoding="utf-8")
+    return resolved
+
+
 def _resolve_remote_path(path: PathLike, parts: tuple[PathLike, ...], resolved: _ResolvedProfile) -> str:
     raw_path = os.fspath(path)
     raw_parts = tuple(os.fspath(part) for part in parts)
@@ -291,12 +428,26 @@ def _resolve_remote_path(path: PathLike, parts: tuple[PathLike, ...], resolved: 
 
 
 def _build_implementation(
-    path: PathLike,
+    path: Optional[PathLike],
     *parts: PathLike,
     profile: Optional[str] = None,
+    profile_connection_params: Optional[Mapping[str, Any]] = None,
 ) -> tuple[Any, str]:
-    raw_path = os.fspath(path)
+    raw_path = "" if path is None else os.fspath(path)
     raw_parts = tuple(os.fspath(part) for part in parts)
+
+    if profile_connection_params is not None:
+        if profile is None:
+            raise InvalidConfigurationException(
+                "`profile_connection_params` requires `profile` to be provided."
+            )
+        if not isinstance(profile_connection_params, Mapping):
+            raise InvalidConfigurationException(
+                "`profile_connection_params` must be a mapping of profile fields."
+            )
+        resolved = _save_profile_connection_params(profile, profile_connection_params)
+        remote_path = _resolve_remote_path(raw_path, raw_parts, resolved)
+        return RemotePath(remote_path, client=_get_client_for_resolved_profile(resolved)), "remote"
 
     if profile is None:
         if _is_remote_uri(raw_path):
@@ -325,11 +476,17 @@ def _unwrap_value(value: Any) -> Any:
 class PPath(os.PathLike[str]):
     def __init__(
         self,
-        path: PathLike,
+        path: Optional[PathLike] = None,
         *parts: PathLike,
         profile: Optional[str] = None,
+        profile_connection_params: Optional[Mapping[str, Any]] = None,
     ) -> None:
-        impl, mode = _build_implementation(path, *parts, profile=profile)
+        impl, mode = _build_implementation(
+            path,
+            *parts,
+            profile=profile,
+            profile_connection_params=profile_connection_params,
+        )
         self._impl = impl
         self._mode = mode
 
