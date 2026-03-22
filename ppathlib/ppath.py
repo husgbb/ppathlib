@@ -25,6 +25,7 @@ _STORAGE_TYPE_TO_URI_SCHEME = {
     "gs": "gs",
     "azure": "az",
 }
+_PUBLIC_REMOTE_STORAGE_TYPES = {"s3"}
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,34 @@ def _storage_type_for_remote_uri(uri: str) -> str:
     storage_type = _REMOTE_URI_SCHEMES.get(scheme)
     if storage_type is None:
         raise InvalidConfigurationException(f"Unsupported remote URI scheme for ppathlib: {uri}")
+    return storage_type
+
+
+def _validate_remote_uri(
+    uri: str,
+    *,
+    expected_storage_type: Optional[str] = None,
+    allow_public: bool = False,
+) -> str:
+    if not _is_remote_uri(uri):
+        raise InvalidConfigurationException(f"Remote URI must be explicit and include a scheme: {uri}")
+
+    parsed = urlparse(uri)
+    storage_type = _storage_type_for_remote_uri(uri)
+    if not parsed.netloc:
+        raise InvalidConfigurationException(
+            f"Remote URI must include a bucket or container name: {uri}"
+        )
+
+    if expected_storage_type is not None and storage_type != expected_storage_type:
+        expected_scheme = _scheme_for_storage_type(expected_storage_type)
+        raise InvalidConfigurationException(f"Expected {expected_scheme}:// URI, got: {uri}")
+
+    if allow_public and storage_type not in _PUBLIC_REMOTE_STORAGE_TYPES:
+        raise InvalidConfigurationException(
+            f"Profile-less public remote access is only supported for s3:// URIs: {uri}"
+        )
+
     return storage_type
 
 
@@ -167,15 +196,24 @@ def _resolve_profile(profile: str) -> _ResolvedProfile:
             raise InvalidConfigurationException(
                 f"Profile {display_name} must define `root` as a non-empty remote URI."
             )
-        if not _is_remote_uri(root):
+        try:
+            _validate_remote_uri(root, expected_storage_type=storage_type)
+        except InvalidConfigurationException as exc:
+            if "Expected " in str(exc):
+                expected_scheme = _scheme_for_storage_type(storage_type)
+                raise InvalidConfigurationException(
+                    f"Profile {display_name} expects {expected_scheme}:// `root` URIs: {root}"
+                ) from exc
+            if "Remote URI must be explicit" in str(exc):
+                raise InvalidConfigurationException(
+                    f"Profile {display_name} must define `root` as an explicit remote URI."
+                ) from exc
             raise InvalidConfigurationException(
-                f"Profile {display_name} must define `root` as an explicit remote URI."
-            )
-        expected_scheme = _scheme_for_storage_type(storage_type)
-        actual_scheme = urlparse(root).scheme.lower()
-        if actual_scheme != expected_scheme:
+                f"Profile {display_name} defines an invalid remote `root`: {root}"
+            ) from exc
+        if urlparse(root).scheme.lower() != _scheme_for_storage_type(storage_type):
             raise InvalidConfigurationException(
-                f"Profile {display_name} expects {expected_scheme}:// `root` URIs: {root}"
+                f"Profile {display_name} expects {_scheme_for_storage_type(storage_type)}:// `root` URIs: {root}"
             )
 
     client_kwargs = {
@@ -191,7 +229,7 @@ def _resolve_profile(profile: str) -> _ResolvedProfile:
 
 
 def _public_profile_for_uri(uri: str) -> _ResolvedProfile:
-    storage_type = _storage_type_for_remote_uri(uri)
+    storage_type = _validate_remote_uri(uri, allow_public=True)
     client_kwargs: dict[str, Any] = {}
     if storage_type == "s3":
         client_kwargs["skip_signature"] = True
@@ -230,12 +268,13 @@ def _resolve_remote_path(path: PathLike, parts: tuple[PathLike, ...], resolved: 
     raw_parts = tuple(os.fspath(part) for part in parts)
 
     if _is_remote_uri(raw_path):
-        expected_scheme = _scheme_for_storage_type(resolved.storage_type)
-        actual_scheme = urlparse(raw_path).scheme.lower()
-        if actual_scheme != expected_scheme:
+        try:
+            _validate_remote_uri(raw_path, expected_storage_type=resolved.storage_type)
+        except InvalidConfigurationException as exc:
+            expected_scheme = _scheme_for_storage_type(resolved.storage_type)
             raise InvalidConfigurationException(
                 f"Profile {resolved.display_name} expects {expected_scheme}:// paths: {raw_path}"
-            )
+            ) from exc
         return _join_remote_uri(raw_path, *raw_parts)
 
     if Path(raw_path).is_absolute():
@@ -393,13 +432,14 @@ class PPath(os.PathLike[str]):
         source = self._impl
         if not isinstance(source, Path):
             raise TypeError("Local-to-remote transfers require a local pathlib.Path source.")
+        remote_target = self._coerce_remote_target(target)
         if source.is_dir():
-            raise NotImplementedError(
-                f"PPath.{method}() does not implement recursive local directory transfers "
-                "to remote targets yet."
+            remote_target._not_implemented(
+                method,
+                "support recursive local directory transfers explicitly before accepting "
+                "directory sources for remote targets",
             )
 
-        remote_target = self._coerce_remote_target(target)
         remote_target.write_bytes(source.read_bytes())
         if method in {"move", "rename", "replace"}:
             source.unlink()

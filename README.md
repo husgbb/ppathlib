@@ -80,13 +80,15 @@ print(path.read_text(encoding="utf-8")[:120])
 
 Returns the public `PPath` object in either local or remote mode.
 
-### `get_client(profile)`
+### `ExperimentalRemoteRuntimeWarning`
 
-Returns the cached profile client for a named remote.
+Warning type emitted by experimental remote runtime operations.
 
-### `clear_client_cache()`
+### `InvalidConfigurationException`
 
-Clears the internal profile-client registry.
+Exception type raised for invalid configuration or invalid remote path inputs.
+
+Internal backend binding types are implementation details and are not part of the top-level API.
 
 ## Documentation
 

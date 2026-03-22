@@ -143,10 +143,19 @@ class RemotePath(os.PathLike[str]):
             raise InvalidConfigurationException(
                 f"Remote paths must be explicit URIs with a scheme: {uri}"
             )
+        if not parsed.netloc:
+            raise InvalidConfigurationException(
+                f"Remote paths must include a bucket or container name: {uri}"
+            )
+        expected_scheme = client._expected_scheme()
+        if parsed.scheme.lower() != expected_scheme:
+            raise InvalidConfigurationException(
+                f"Profile {client.profile_name} expects {expected_scheme}:// URIs: {uri}"
+            )
 
         self._raw_uri = uri
         self._client = client
-        self._scheme = parsed.scheme
+        self._scheme = parsed.scheme.lower()
         self._drive = parsed.netloc
         self._key = parsed.path.lstrip("/")
         lexical = "/".join(part for part in [self._drive, self._key] if part)
@@ -273,6 +282,8 @@ class RemotePath(os.PathLike[str]):
             raise ValueError(f"{other!r} is not a RemotePath")
         if self.anchor != other.anchor:
             raise ValueError(f"{self} and {other} use different URI schemes")
+        if self.drive != other.drive:
+            raise ValueError(f"{self} and {other} use different buckets or containers")
         if not walk_up:
             return self._pure.relative_to(other._pure)
         relative = posixpath.relpath(self._pure.as_posix(), other._pure.as_posix())
@@ -309,22 +320,28 @@ class RemotePath(os.PathLike[str]):
         newline = kwargs.pop("newline", None)
 
         if args or kwargs:
-            raise NotImplementedError(
-                "PPath.open() supports only mode, buffering, encoding, errors, and newline "
-                "for remote mode in the current runtime slice."
+            self._not_implemented(
+                "open",
+                "support additional open() parameters explicitly before accepting them in "
+                "remote mode",
             )
         if buffering not in (-1, 1):
-            raise NotImplementedError(
-                "PPath.open() does not implement custom buffering behavior for remote mode yet."
+            self._not_implemented(
+                "open",
+                "support custom buffering behavior explicitly before accepting it in remote "
+                "mode",
             )
         if errors not in (None, "strict"):
-            raise NotImplementedError(
-                "PPath.open() does not implement non-default error handling for remote mode yet."
+            self._not_implemented(
+                "open",
+                "support non-default error handling explicitly before accepting it in "
+                "remote mode",
             )
         if any(flag in mode for flag in ("a", "x", "+")):
-            raise NotImplementedError(
-                "PPath.open() does not implement append, exclusive creation, or read/write "
-                "modes for remote paths yet."
+            self._not_implemented(
+                "open",
+                "support append, exclusive creation, and read/write mixed modes explicitly "
+                "before accepting them in remote mode",
             )
 
         store = self._store()
@@ -341,16 +358,20 @@ class RemotePath(os.PathLike[str]):
                 return _RemoteBytesWriter(store, key)
             return _RemoteTextWriter(store, key, encoding=encoding, newline=newline)
 
-        raise NotImplementedError(f"PPath.open() does not support mode={mode!r} for remote paths yet.")
+        self._not_implemented(
+            "open",
+            f"support mode={mode!r} explicitly before accepting it in remote mode",
+        )
 
     def read_text(self, *args: Any, **kwargs: Any) -> str:
         self._warn_runtime_operation("read_text")
         encoding = kwargs.pop("encoding", None) or "utf-8"
         errors = kwargs.pop("errors", None) or "strict"
         if args or kwargs:
-            raise NotImplementedError(
-                "PPath.read_text() supports only the `encoding` and `errors` arguments "
-                "for remote mode in the current runtime slice."
+            self._not_implemented(
+                "read_text",
+                "support additional read_text() arguments explicitly before accepting them "
+                "in remote mode",
             )
         return self._read_bytes_impl().decode(encoding, errors)
 
@@ -364,9 +385,10 @@ class RemotePath(os.PathLike[str]):
         encoding = kwargs.pop("encoding", None) or "utf-8"
         errors = kwargs.pop("errors", None) or "strict"
         if len(args) > 1 or kwargs:
-            raise NotImplementedError(
-                "PPath.write_text() supports only `data`, `encoding`, and `errors` for "
-                "remote mode in the current runtime slice."
+            self._not_implemented(
+                "write_text",
+                "support additional write_text() arguments explicitly before accepting them "
+                "in remote mode",
             )
         payload = data.encode(encoding, errors)
         self._write_bytes_impl(payload)
@@ -496,6 +518,7 @@ class RemotePath(os.PathLike[str]):
         target_path = self._coerce_target_path(target, method="copy")
         if isinstance(target_path, Path):
             return self._copy_to_local_path(target_path, method="copy")
+        self._ensure_non_directory_source("copy")
 
         if self._can_use_native_remote_transfer(target_path):
             self._store().copy(self._store_key(), target_path._store_key(), overwrite=True)
@@ -547,6 +570,7 @@ class RemotePath(os.PathLike[str]):
             copied = self._copy_to_local_path(target_path, method=method)
             self._delete_impl(missing_ok=False)
             return copied
+        self._ensure_non_directory_source(method)
 
         if self._can_use_native_remote_transfer(target_path):
             self._store().rename(self._store_key(), target_path._store_key(), overwrite=True)
@@ -557,9 +581,8 @@ class RemotePath(os.PathLike[str]):
         return target_path
 
     def _delete_impl(self, *, missing_ok: bool) -> None:
+        self._ensure_non_directory_source("unlink")
         key = self._store_key()
-        if key == "":
-            raise IsADirectoryError(f"Remote root prefixes cannot be unlinked: {self}")
         try:
             self._store().delete(key)
         except FileNotFoundError as exc:
@@ -720,7 +743,7 @@ class RemotePath(os.PathLike[str]):
                 "support remote-to-local transfers for profileless public URIs explicitly "
                 "before accepting local targets",
             )
-        if self._is_dir_impl():
+        if self._is_directory_like_source():
             self._not_implemented(
                 method,
                 "support recursive remote directory transfers explicitly before accepting "
@@ -754,6 +777,24 @@ class RemotePath(os.PathLike[str]):
             f"PPath.{method}() is not implemented for remote mode. Path={self}. "
             f"Profile={self.client.profile_name}. Storage type={self.client.storage_type}. "
             f"Required implementation: {required_implementation}."
+        )
+
+    def _is_directory_like_source(self) -> bool:
+        return not self._is_file_impl() and self._is_dir_impl()
+
+    def _ensure_non_directory_source(self, method: str) -> None:
+        if not self._is_directory_like_source():
+            return
+        if method == "unlink":
+            self._not_implemented(
+                method,
+                "support recursive remote directory deletion explicitly before accepting "
+                "directory-like prefixes as unlink targets",
+            )
+        self._not_implemented(
+            method,
+            "support recursive remote directory transfers explicitly before accepting "
+            "directory-like prefixes as sources",
         )
 
     def _looks_like_remote_uri(self, value: str) -> bool:
